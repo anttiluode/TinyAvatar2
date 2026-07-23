@@ -1,6 +1,6 @@
 # TinyAvatar 2
 
-![pic1](ragdoll.png)
+![pic](pic.png)
 
 A generative face model built out of nothing but wave interference — plus the
 trainer, the studio that drives it, and two tools that came out of asking what
@@ -121,6 +121,8 @@ spring-back · `w` wobble (latent velocity) · `b` bake as new identity ·
 `r` reset · `n` new random identity · `--image me.png` · `--record out.mp4`.
 
 ### The ragdoll gates, measured
+
+![pic1](ragdoll.png)
 
 "Pull one eye and the head moves with it" is a registered gate (RG1), not
 marketing. Drag a pin at the left-eye region by +0.08 in x, solve to
