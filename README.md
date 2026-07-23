@@ -1,5 +1,9 @@
 # TinyAvatar 2
 
+EDIT: Added a model2.pt model file you can play with right now. It was trained 
+by celeba dataset for 30k steps. The identity changes in it as it is different celebrity 
+shots by paparazzis. 
+
 ![ragdoll](ragdoll.png)
 
 A generative face model built out of nothing but wave interference — plus the
