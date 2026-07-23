@@ -1,5 +1,7 @@
 # TinyAvatar 2
 
+![pic1](ragdoll.png)
+
 A generative face model built out of nothing but wave interference — plus the
 trainer, the studio that drives it, and two tools that came out of asking what
 else the thing can do:
