@@ -1,5 +1,9 @@
 # TinyAvatar 2
 
+EDIT: Added splat ragdoll. In which we can drag the trained model around 
+via dragging from splats. It is compatible with other models trained on the older 
+code too. 
+
 EDIT: Model I made with this really is not 7. Turns out it is 96 megs. 
 Lots of weird stuff here. --
 
