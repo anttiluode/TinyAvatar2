@@ -1,5 +1,8 @@
 # TinyAvatar 2
 
+EDIT: Model I made with this really is not 7. Turns out it is 96 megs. 
+Lots of weird stuff here. --
+
 A ~7 MB generative face model built out of nothing but wave interference,
 plus the studio that trains and drives it.
 
