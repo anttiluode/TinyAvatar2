@@ -10,7 +10,15 @@
 #                          resumable runs, and — new — exposes the constant-Q
 #                          BASIS knobs with a live octave-ladder preview
 #   Tab 4  Avatar Driver   phase-transport pursuit driving webcam or latent
-#                          walk, rendered into the app
+#                          walk, rendered into the app — and, new, PIN
+#                          DRIVING: landmarks go through the decoder Jacobian
+#                          instead of the encoder, restricted to the compliant
+#                          subspace, so stiff/background directions are
+#                          unreachable rather than merely penalised. Off by
+#                          default; needs pin_driver.py and splat_ragdoll.py
+#                          alongside. See pin_driver.py for the argument, the
+#                          registered gates PD0-PD3, and what is still
+#                          unmeasured (PD3, identity retention).
 #
 # WHAT CHANGED FROM tiny_avatar3, AND WHY
 # ---------------------------------------
@@ -1093,6 +1101,11 @@ class AvatarWorker(QThread):
         self.norm = True
         self.align = True
         self.walk_step, self.z_max = 2.5, 12.0
+        # pin driving (pin_driver.py). Off by default: the encoder path is the
+        # incumbent and this one's identity-retention gate (PD3) is unmeasured.
+        self.pin = False
+        self.pin_k = 24
+        self.pin_gain = 1.0
         self._stop = False
 
     def stop(self):
@@ -1106,7 +1119,10 @@ class AvatarWorker(QThread):
             ren = model.ren
             self.status.emit(describe_ckpt(ck) + f"  on {dev}")
             if self.source == "webcam":
-                self._webcam(model, ren, dev, torch)
+                if self.pin:
+                    self._webcam_pin(model, ren, dev, torch)
+                else:
+                    self._webcam(model, ren, dev, torch)
             else:
                 self._walk(model, ren, dev, torch)
         except Exception as e:
@@ -1156,6 +1172,80 @@ class AvatarWorker(QThread):
             fps = 0.9 * fps + 0.1 / max(now - t_last, 1e-6); t_last = now
             self.frame.emit(cam, av, fps)
             f += 1
+        cap.release()
+
+    def _webcam_pin(self, model, ren, dev, torch):
+        """Pin driving: landmarks -> decoder Jacobian -> z, restricted to the
+        compliant subspace. See pin_driver.py for the argument and the gates.
+        The encoder is used exactly once, to set the anchor identity."""
+        import cv2 as cv
+        try:
+            from pin_driver import (build_control_basis, PinDriver,
+                                    Landmarker, render_from_params)
+        except Exception as e:
+            self.status.emit(f"pin driving needs pin_driver.py + "
+                             f"splat_ragdoll.py next to this file ({e})")
+            return
+        cap = cv.VideoCapture(0)
+        if not cap.isOpened():
+            self.status.emit("webcam failed to open")
+            return
+        framer = FaceFramer() if self.align else None
+        lmk = Landmarker("auto")
+        drv = None
+        z_anchor = None
+        calibrated = False
+        t_last, fps = time.time(), 0.0
+        while not self._stop:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if framer is not None:
+                crop = framer.crop(frame)
+            else:
+                h, w = frame.shape[:2]; s = min(h, w)
+                crop = frame[(h - s)//2:(h + s)//2, (w - s)//2:(w + s)//2]
+
+            if z_anchor is None:
+                x = cv.resize(crop, (ren.H, ren.W))[:, :, ::-1].astype(
+                    np.float32) / 255.0
+                if self.norm:
+                    x = normalize_crop(x)
+                xt = torch.from_numpy(np.ascontiguousarray(
+                    x.transpose(2, 0, 1)))[None].to(dev)
+                with torch.no_grad():
+                    z_anchor = model.enc(xt)[0][0]
+                self.status.emit("building compliant subspace...")
+                V, sv, info = build_control_basis(
+                    model, z_anchor, k=self.pin_k, verbose=False)
+                live = int((sv / (sv[0] + 1e-30) > 0.05).sum())
+                drv = PinDriver(model, z_anchor, V, iters=3)
+                self.status.emit(
+                    f"pin driving  k={self.pin_k}  ({live} directions above "
+                    f"5% of the leading mode)  landmarks={lmk.backend}"
+                    + ("  [haar = 2 pins, pose only; pip install mediapipe "
+                       "for expression]" if lmk.backend == "haar" else ""))
+
+            lm = lmk.detect(crop)
+            if lm is not None and not calibrated:
+                calibrated = drv.calibrate(lm)
+            with torch.no_grad():
+                if lm is not None and calibrated:
+                    z, _ = drv.step(lm, gain=self.pin_gain)
+                else:
+                    z = drv.z()
+                img = render_from_params(
+                    ren, *ren.activate(model.dec(z[None]).float()))
+            av = (img[0].clamp(0, 1) * 255).byte().permute(
+                1, 2, 0).cpu().numpy()
+            cam = cv.resize(crop, (256, 256))[:, :, ::-1].copy()
+            if lm is not None:
+                for (u, v) in lm:
+                    cv.drawMarker(cam, (int(u * 256), int(v * 256)),
+                                  (255, 220, 0), cv.MARKER_CROSS, 10, 2)
+            now = time.time()
+            fps = 0.9 * fps + 0.1 / max(now - t_last, 1e-6); t_last = now
+            self.frame.emit(cam, av, fps)
         cap.release()
 
     def _walk(self, model, ren, dev, torch):
@@ -1252,6 +1342,19 @@ class AvatarTab(QWidget):
                                    "frames)")
         self.align_chk.setChecked(True); self.align_chk.toggled.connect(self.push_params)
         g.addWidget(self.align_chk, 4, 0, 1, 3)
+        self.pin_chk = QCheckBox(
+            "pin driving (landmarks -> decoder Jacobian, restricted to the "
+            "compliant subspace; needs pin_driver.py)")
+        self.pin_chk.setChecked(False)
+        self.pin_chk.toggled.connect(self.push_params)
+        g.addWidget(self.pin_chk, 5, 0, 1, 3)
+        self.pk_sl = QSlider(Qt.Orientation.Horizontal)
+        self.pk_sl.setRange(4, 64); self.pk_sl.setValue(24)
+        self.pk_val = QLabel("24")
+        self.pk_sl.valueChanged.connect(
+            lambda v: (self.pk_val.setText(str(v)), self.push_params()))
+        g.addWidget(QLabel("compliant basis rank k"), 6, 0)
+        g.addWidget(self.pk_sl, 6, 1); g.addWidget(self.pk_val, 6, 2)
         hb = QHBoxLayout()
         self.cam_btn = QPushButton("Start webcam"); self.cam_btn.setObjectName("accent")
         self.cam_btn.clicked.connect(lambda: self.start("webcam"))
@@ -1261,7 +1364,7 @@ class AvatarTab(QWidget):
         self.stop_btn.setEnabled(False); self.stop_btn.clicked.connect(self.stop)
         hb.addWidget(self.cam_btn); hb.addWidget(self.walk_btn)
         hb.addWidget(self.stop_btn); hb.addStretch(1)
-        g.addLayout(hb, 5, 0, 1, 3)
+        g.addLayout(hb, 7, 0, 1, 3)
         lay.addWidget(ctl)
         self.status = QLabel("load a model, then Start"); self.status.setObjectName("stat")
         lay.addWidget(self.status)
@@ -1312,6 +1415,8 @@ class AvatarTab(QWidget):
             self.worker.alpha = self.al_sl.value() / 100
             self.worker.norm = self.norm_chk.isChecked()
             self.worker.align = self.align_chk.isChecked()
+            self.worker.pin = self.pin_chk.isChecked()
+            self.worker.pin_k = self.pk_sl.value()
 
     def start(self, source):
         mp = self.model_combo.currentData()
