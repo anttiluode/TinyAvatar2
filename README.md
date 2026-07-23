@@ -253,6 +253,7 @@ feature" behaviour without it, by soft selection.)
 ## Run order
 
 ```bash
+pip install -r requirements.txt
 python splat_ragdoll.py --model model2.pt              # play first
 python splat_trainer5.py --smoke                       # 21 CPU checks, no data
 python splat_trainer5.py --compare --data_dir faces1 --steps 3000
