@@ -1,5 +1,7 @@
 # TroubleShootingFaceSharpness
 
+![pic](ceiling_strip.png)
+
 EDIT: A thing that was not discussed was. The training data of my face was 
 shot with crappy trust webcam and looking at training images, there are blurry 
 images. I think that has lot to do with the results. So dataset quality and resolution 
@@ -20,6 +22,8 @@ looked for.
 ---
 
 ## The observation
+
+![pic2](recon_strip.png)
 
 `model5_constQ.pt` — 128px, 512 packets, constant-Q q=0.6, 5 octaves,
 f_max=32, `band_mode=permute`, `splat_trainer5`, ~45k steps overnight on
