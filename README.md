@@ -397,6 +397,70 @@ to `permute`. For the same reason, **every consumer must load through
 alone renders legacy checkpoints with wrong formulas at up to 0.57 max error,
 with no exception raised.
 
+## Face sharpness — what we know
+
+The 128px own-face model renders the room sharply and the face as a soft mass.
+This is the most visible limitation in the repo, so here is the honest state of
+it.
+
+We went looking for the cause and ruled out six mechanisms by measurement
+before we found anything. All numbers are from `model5_constQ.pt`, 128px / 512
+packets, ~45k steps, ~1900 own-face frames.
+
+| Hypothesis | Verdict |
+|---|---|
+| The live driver / pursuit smoothing is blurring it | **No** — a direct reconstruction of a *training* frame is equally soft |
+| The face is a small, low-contrast region the loss ignores | **No** — it holds 1.97× its fair share of detail energy and has *higher* contrast than the room (gradient ratio 1.619) |
+| The optimizer starves the face relative to its stake | **No** — residual share 40.88% against detail share 40.68%, ratio **1.00** |
+| The model is band-limited, dropping the top octaves | **No** — capture per octave 0.999 / 0.993 / 0.979 / 0.942 / 0.861, no cliff |
+| High frequencies are missing *specifically* over the face | **No** — inside/outside capture ratio 1.00 / 1.00 / 1.00 / 1.00 / 0.93 |
+| The latent collapses distinct poses onto a mean face | **No** — reconstruction pairs preserve **98.8%** of the distance between input pairs |
+
+What did turn up: the face region of this dataset has an **effective rank of
+1.8** — roughly one dominant mode of variation — and the model carries about
+1.1 of it. The footage is a man sitting still, moving a little and opening his
+mouth. There is not much else in it to learn.
+
+### The current read (a hypothesis, not a result)
+
+Resolution and dataset quality are probably most of it:
+
+- **~1900 frames** is a small dataset, and it spans very little expression.
+- The capture was a cheap webcam, and **frames caught mid-turn are motion
+  blurred**. The background never moves, so it is never blurred; the face does.
+  A model trained faithfully on partly-blurred face targets and sharp
+  background targets would look exactly like this. *This is the most promising
+  remaining explanation and it has not been measured.*
+- At 128px full frame the face is roughly **50px wide**, which puts an eyelid
+  line at about 1px. No basis, latent or loss can render detail the data does
+  not contain. A tighter crop moves face features down the octave ladder into
+  bands with full coverage.
+
+A larger, sharper dataset at higher resolution with the blurred frames removed
+would very likely help a lot. That is a prediction and it is written here as
+one — nobody has run it.
+
+### One gate is still open
+
+`FS9` asks whether the remaining softness is *all* there is, by comparing the
+reconstruction against a synthetic twin of the input attenuated by exactly the
+losses we measured. If the two match, the model is at its information ceiling
+for this canvas. If they do not, something is going wrong in space that every
+spectral measurement so far has averaged away. **The number is not recorded
+yet.** Until it is, "it's just resolution" is a hypothesis.
+
+### The full ledger
+
+See **[`TroubleShootingFaceSharpness/`](TroubleShootingFaceSharpness/)** for the
+three diagnostic tools (`face_budget.py`, `face_dof.py`,
+`sharpness_ceiling.py`), every measurement above with its context, the
+pre-registered gates, and a nine-item log of the wrong turns — including two
+metric bugs that produced confident wrong answers before they were caught.
+
+Every selftest in that folder is two-sided: each gate has to fire on a planted
+positive *and* stay silent on a planted negative. A gate that only fires is not
+a test.
+
 ### The dyadic tree that did not work
 
 The natural next idea was a bifurcating quadtree — parents spawn four children
