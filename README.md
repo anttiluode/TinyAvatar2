@@ -1,5 +1,8 @@
 # TinyAvatar 2
 
+EDIT: After training you have to re start the software to drive a model. 
+Else you get the cpu \ gpu conflict. 
+
 ![pic](pic.png)
 
 A generative face model built out of nothing but wave interference — plus the
