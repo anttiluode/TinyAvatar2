@@ -1,5 +1,12 @@
 # TinyAvatar 2
 
+EDIT: Added the TroubleShootingFaceSharpness sub folder where we thought about 
+the issue. I think resolution and dataset quality has a lot to do with it. The 
+model with my face had only 1900 images and was shot with crappy trust webcam 
+and there were blurry images in the dataset as I turned. Larger dataset, sharp 
+images. removing blurry ones. Higher resolution, would probably produce incredible 
+results. 
+
 EDIT: After training you have to re start the software to drive a model. 
 Else you get the cpu \ gpu conflict. 
 
