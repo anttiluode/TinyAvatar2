@@ -1,0 +1,370 @@
+E:\DocsHouse\893 tinyavatar4>python3.13 face_budget.py --selftest
+ST0  gaussian_blur preserves DC
+     |mean(a)-mean(blur(a))| = 2.66e-04  (<1e-3)  [V]
+
+ST1  blur kills high-pass energy, keeps low-pass
+     detail(blurred)/detail(sharp) = 0.0000  (<0.1)  [V]
+
+ST2  POSITIVE control -- planted LOW-contrast face must trip FS1/FS2
+
+  region: planted low-contrast face  [full, includes silhouette]
+    area share of canvas           13.51 %
+    detail-energy share (s=2px)   9.67 %   concentration  0.72x area
+    mean |grad|  inside 0.01451   outside 0.04598   ratio 0.316
+    luminance    inside  p5 0.215  p95 0.226  mean 0.229
+                 outside p5 0.405  p95 0.594  mean 0.500
+
+  region: planted low-contrast face  [interior, eroded 8px]  <-- GATED
+    area share of canvas            5.80 %
+    detail-energy share (s=2px)   0.01 %   concentration  0.00x area
+    mean |grad|  inside 0.00224   outside 0.04416   ratio 0.051
+    luminance    inside  p5 0.215  p95 0.225  mean 0.220
+                 outside p5 0.221  p95 0.592  mean 0.479
+    silhouette carries  99.9% of this region's detail energy
+    FS1 detail_share 0.01% < 0.5*area 2.90%   [V]
+    FS2 grad ratio   0.051 < 0.60                 [V]
+     -> FS1 V  FS2 V   (both must be V)  [V]
+
+ST3  NEGATIVE control -- planted HIGH-contrast face must NOT trip FS1
+
+  region: planted high-contrast face  [full, includes silhouette]
+    area share of canvas           13.51 %
+    detail-energy share (s=2px)  76.18 %   concentration  5.64x area
+    mean |grad|  inside 0.08747   outside 0.01315   ratio 6.650
+    luminance    inside  p5 0.047  p95 0.448  mean 0.231
+                 outside p5 0.477  p95 0.524  mean 0.499
+
+  region: planted high-contrast face  [interior, eroded 8px]  <-- GATED
+    area share of canvas            5.80 %
+    detail-energy share (s=2px)  27.09 %   concentration  4.67x area
+    mean |grad|  inside 0.08189   outside 0.01958   ratio 4.181
+    luminance    inside  p5 0.045  p95 0.393  mean 0.220
+                 outside p5 0.253  p95 0.523  mean 0.478
+    silhouette carries  64.4% of this region's detail energy
+    FS1 detail_share 27.09% < 0.5*area 2.90%   [K]
+    FS2 grad ratio   4.181 < 0.60                 [K]
+     -> FS1 must be K: K (good)  [V]
+
+ST4  motion mask finds the moving patch
+     motion-mask density inside patch / overall = 6.70  (>1.5)  [V]
+
+ST5  POSITIVE -- a band-limited recon must trip FS5
+
+  FS5  where the model gives up, by octave
+      band (cyc/img)   share of image power   fraction captured
+        1.0 -   2.0         3.917 %           0.997  #############################
+        2.0 -   4.0        11.565 %           0.992  #############################
+        4.0 -   8.0        21.155 %           0.910  ###########################
+        8.0 -  16.0        33.958 %           0.474  ##############
+       16.0 -  32.0        26.180 %           0.050  #
+    FS5 top-octave captured 0.050 < 0.5 * mid-octave 0.455   [V]
+        [V] => the model is BAND-LIMITED, not spatially starved:
+        it drops the top octaves everywhere.  Room structure is
+        low-frequency so it survives; eyelids and lip contours are
+        not, so they do not.
+     -> must be V  [V]
+
+ST6  NEGATIVE -- a proportionally-degraded recon must NOT trip FS5
+
+  FS5  where the model gives up, by octave
+      band (cyc/img)   share of image power   fraction captured
+        1.0 -   2.0         3.917 %           0.990  #############################
+        2.0 -   4.0        11.565 %           0.990  #############################
+        4.0 -   8.0        21.155 %           0.990  #############################
+        8.0 -  16.0        33.958 %           0.990  #############################
+       16.0 -  32.0        26.180 %           0.990  #############################
+    FS5 top-octave captured 0.990 < 0.5 * mid-octave 0.495   [K]
+        [V] => the model is BAND-LIMITED, not spatially starved:
+        it drops the top octaves everywhere.  Room structure is
+        low-frequency so it survives; eyelids and lip contours are
+        not, so they do not.
+     -> must be K  [V]
+
+ST7  coverage arithmetic is monotone decreasing in frequency
+
+  areal coverage per octave  (128px, 512 packets, 5 octaves, q=0.6, f 1.0-32.0)
+  102 packets per band; envelope sigma = q/f (canvas = 1.0)
+      band (cyc/img)   sigma_px   footprint px^2   expected cover
+        1.0 -   2.0     54.31      37059.7        100.0 %
+                     (at f=2: sigma 38.40px, cover 100.0 %)
+        2.0 -   4.0     27.15       9264.9        100.0 %
+                     (at f=4: sigma 19.20px, cover 100.0 %)
+        4.0 -   8.0     13.58       2316.2        100.0 %
+                     (at f=8: sigma 9.60px, cover 99.9 %)
+        8.0 -  16.0      6.79        579.1         97.3 %
+                     (at f=16: sigma 4.80px, cover 83.5 %)
+       16.0 -  32.0      3.39        144.8         59.4 %
+                     (at f=32: sigma 2.40px, cover 36.3 %)
+  cover = 1 - exp(-n*area/canvas), random placement with overlap.
+  A band below ~80% cannot represent detail everywhere, no matter
+  how well it is trained.  Cropping tighter does not raise this
+  number -- it moves face features DOWN the ladder into bands that
+  are already at 100%.
+     covers [1.0, 1.0, 1.0, 0.973, 0.594]  monotone  [V]
+
+SELFTEST ALL [V]
+
+E:\DocsHouse\893 tinyavatar4>python3.13 face_budget.py --coverage
+
+  areal coverage per octave  (128px, 512 packets, 5 octaves, q=0.6, f 1.0-32.0)
+  102 packets per band; envelope sigma = q/f (canvas = 1.0)
+      band (cyc/img)   sigma_px   footprint px^2   expected cover
+        1.0 -   2.0     54.31      37059.7        100.0 %
+                     (at f=2: sigma 38.40px, cover 100.0 %)
+        2.0 -   4.0     27.15       9264.9        100.0 %
+                     (at f=4: sigma 19.20px, cover 100.0 %)
+        4.0 -   8.0     13.58       2316.2        100.0 %
+                     (at f=8: sigma 9.60px, cover 99.9 %)
+        8.0 -  16.0      6.79        579.1         97.3 %
+                     (at f=16: sigma 4.80px, cover 83.5 %)
+       16.0 -  32.0      3.39        144.8         59.4 %
+                     (at f=32: sigma 2.40px, cover 36.3 %)
+  cover = 1 - exp(-n*area/canvas), random placement with overlap.
+  A band below ~80% cannot represent detail everywhere, no matter
+  how well it is trained.  Cropping tighter does not raise this
+  number -- it moves face features DOWN the ladder into bands that
+  are already at 100%.
+
+E:\DocsHouse\893 tinyavatar4>python3.13 face_budget.py --recon --data faces1 --n 64 --model runs/tiny2/model5_constQ.pt
+  trainer module: splat_trainer5
+  [haar] cascade xml not found (the Windows Store python issue)
+         -> use --box x0,y0,x1,y1, or rely on the motion region
+  region for FS3/FS4: motion (var > p85)  (19.5% of canvas)
+
+  BN mode = eval
+    overall MSE            0.001485   (PSNR 28.28 dB)
+    MSE inside region      0.003118
+    MSE outside region     0.001090
+    residual share inside   40.88 %
+
+  BN mode = batch
+    overall MSE            0.001473   (PSNR 28.32 dB)
+    MSE inside region      0.003074
+    MSE outside region     0.001086
+    residual share inside   40.64 %
+
+    detail share, SAME mask (s=2px)   40.68 %
+    FS3 residual 40.88% > 2.0 * detail 81.37%   [K]
+        ratio residual/detail = 1.00   (1.00 = model treats this region exactly in proportion to the signal it holds)
+
+  FS5  where the model gives up, by octave
+      band (cyc/img)   share of image power   fraction captured
+        1.0 -   2.0        79.934 %           0.999  #############################
+        2.0 -   4.0        15.227 %           0.993  #############################
+        4.0 -   8.0         3.771 %           0.979  #############################
+        8.0 -  16.0         0.842 %           0.942  ############################
+       16.0 -  32.0         0.190 %           0.861  #########################
+    FS5 top-octave captured 0.861 < 0.5 * mid-octave 0.490   [K]
+        [V] => the model is BAND-LIMITED, not spatially starved:
+        it drops the top octaves everywhere.  Room structure is
+        low-frequency so it survives; eyelids and lip contours are
+        not, so they do not.
+
+  areal coverage per octave  (128px, 512 packets, 5 octaves, q=0.6, f 1.0-32.0)
+  102 packets per band; envelope sigma = q/f (canvas = 1.0)
+      band (cyc/img)   sigma_px   footprint px^2   expected cover
+        1.0 -   2.0     54.31      37059.7        100.0 %
+                     (at f=2: sigma 38.40px, cover 100.0 %)
+        2.0 -   4.0     27.15       9264.9        100.0 %
+                     (at f=4: sigma 19.20px, cover 100.0 %)
+        4.0 -   8.0     13.58       2316.2        100.0 %
+                     (at f=8: sigma 9.60px, cover 99.9 %)
+        8.0 -  16.0      6.79        579.1         97.3 %
+                     (at f=16: sigma 4.80px, cover 83.5 %)
+       16.0 -  32.0      3.39        144.8         59.4 %
+                     (at f=32: sigma 2.40px, cover 36.3 %)
+  cover = 1 - exp(-n*area/canvas), random placement with overlap.
+  A band below ~80% cannot represent detail everywhere, no matter
+  how well it is trained.  Cropping tighter does not raise this
+  number -- it moves face features DOWN the ladder into bands that
+  are already at 100%.
+
+  wrote recon_strip.png  (input | recon | |error|, BN=eval)
+  CHECK: is the recon FRAMED the same as the input?  If this
+  loader resizes but training face-cropped, the encode is
+  off-distribution and FS3 is not interpretable.
+
+  FS4: finite-difference Jacobian via model.ren(dec(z))()
+    singular values (top 12): 20.899 7.114 1.601 0.239 0.224 0.121 0.110 0.084 0.074 0.072 0.064 0.062
+    dims to reach 90% of face-motion energy: 2 / 128
+    participation ratio (effective rank):    1.4
+    reading: a cliff after ~5 dims => the decoder listens to
+    almost none of z over the face, and beta is real.  A broad
+    spectrum => beta is a distraction, it is the loss budget.
+
+E:\DocsHouse\893 tinyavatar4>python3.13 face_dof.py --selftest
+SD1  data_rank recovers a planted rank-3 dataset
+     eff rank 2.94 (want ~3), dims to 90% = 3 (want 3)  [V]
+
+SD2  recon_diversity: identity ~1.0, constant ~0.0
+     identity ratio 1.000 (want ~1)   constant ratio 0.000 (want ~0)  [V]
+
+SD3  POSITIVE -- blur applied ONLY inside the mask must trip FS6
+
+  FS6  capture per octave, INSIDE vs OUTSIDE the face region
+      band (cyc/img)    inside            outside        in/out
+        1.0 -   2.0    0.975 ###################   0.996    0.98
+        2.0 -   4.0    0.942 ##################    0.997    0.94
+        4.0 -   8.0    0.646 ############          0.994    0.65
+        8.0 -  16.0    0.166 ###                   0.989    0.17
+    FS6 top-octave inside 0.166 < 0.6 * outside 0.593   [V]
+        [V] => the high frequencies are missing SPECIFICALLY over
+        the face.  Neither FS3 (spatial) nor FS5 (spectral) can see
+        this, because each marginalises out the axis it lives on.
+     -> must be V  [V]
+
+SD4  NEGATIVE -- blur applied EVERYWHERE must NOT trip FS6
+
+  FS6  capture per octave, INSIDE vs OUTSIDE the face region
+      band (cyc/img)    inside            outside        in/out
+        1.0 -   2.0    0.989 ###################   0.989    1.00
+        2.0 -   4.0    0.947 ##################    0.952    1.00
+        4.0 -   8.0    0.631 ############          0.658    0.96
+        8.0 -  16.0    0.110 ##                    0.138    0.79
+    FS6 top-octave inside 0.110 < 0.6 * outside 0.083   [K]
+        [V] => the high frequencies are missing SPECIFICALLY over
+        the face.  Neither FS3 (spatial) nor FS5 (spectral) can see
+        this, because each marginalises out the axis it lives on.
+     -> must be K  [V]
+
+SD5  soft_window tapers (no step edge for the FFT to see)
+     max |grad| tapered 0.130 vs hard 0.500  [V]
+
+SELFTEST ALL [V]
+
+E:\DocsHouse\893 tinyavatar4>python3.13 face_dof.py --data faces1 --n 200
+loading 200 images at 128px
+  region: motion (var > p85, closed)  full 18.5%  interior 2.1% of canvas
+
+  FS8  DATA rank over the face interior (200 frames)
+       singular values (top 12): 72.3 21.1 9.8 9.2 5.8 5.5 3.9 3.7 3.1 2.8 2.2 2.1
+       dims to 90% of variance: 2
+       effective rank:          1.8
+       (background, for scale:  eff rank 12.5, 16 dims to 90%)
+
+  no --model given, stopping after FS8
+  FS8 is the ceiling: the model cannot carry more DOF than the
+  data has.  Compare it against FS4b before touching beta.
+
+E:\DocsHouse\893 tinyavatar4>python3.13 face_dof.py --data faces1 --n 64 --model runs/tiny2/model5_constQ.pt
+loading 64 images at 128px
+  region: motion (var > p85, closed)  full 19.5%  interior 2.2% of canvas
+
+  FS8  DATA rank over the face interior (64 frames)
+       singular values (top 12): 41.4 11.9 7.6 5.9 4.1 2.9 2.7 2.3 1.9 1.5 1.3 1.1
+       dims to 90% of variance: 2
+       effective rank:          1.9
+       (background, for scale:  eff rank 10.2, 13 dims to 90%)
+  trainer module: splat_trainer5
+
+  FS6  capture per octave, INSIDE vs OUTSIDE the face region
+      band (cyc/img)    inside            outside        in/out
+        1.0 -   2.0    0.998 ###################   0.999    1.00
+        2.0 -   4.0    0.998 ###################   0.998    1.00
+        4.0 -   8.0    0.991 ###################   0.988    1.00
+        8.0 -  16.0    0.957 ###################   0.957    1.00
+       16.0 -  32.0    0.825 ################      0.883    0.93
+    FS6 top-octave inside 0.825 < 0.6 * outside 0.530   [K]
+        [V] => the high frequencies are missing SPECIFICALLY over
+        the face.  Neither FS3 (spatial) nor FS5 (spectral) can see
+        this, because each marginalises out the axis it lives on.
+
+  FS7  reconstruction diversity over the face interior
+       median RMS between INPUT pairs  0.3198
+       median RMS between RECON pairs  0.3037
+    FS7 ratio 0.988 < 0.50   [K]
+        [V] => the decoder is squeezing distinct poses onto nearly
+        the same face.  That is the conditional mean, and it is a
+        latent-capacity result, not a basis result.
+
+  FS4b Jacobian at REAL latents (via ren(dec(z))), 4 samples
+       sample 0: |z|   2.28   sv 2.11 0.36 0.25 0.11 0.02 0.02   eff rank 1.2   1 dims to 90%
+       sample 1: |z|   0.86   sv 7.87 0.60 0.29 0.04 0.04 0.03   eff rank 1.0   1 dims to 90%
+       sample 2: |z|   1.55   sv 1.04 0.24 0.14 0.03 0.02 0.02   eff rank 1.4   1 dims to 90%
+       sample 3: |z|   1.25   sv 5.52 0.25 0.12 0.04 0.03 0.02   eff rank 1.0   1 dims to 90%
+       ORIGIN z=0 (v2's probe point, |z| 0.00): eff rank 1.0, 1 dims to 90%
+
+       model eff rank at real latents: 1.1   vs DATA eff rank 1.9
+       => the model is carrying about as many DOF as the data
+          has.  Lowering beta buys nothing; capture footage
+          with more expression range instead.
+
+E:\DocsHouse\893 tinyavatar4>
+
+E:\DocsHouse\893 tinyavatar4>python3.13 sharpness_ceiling.py --selftest
+SC1  band_gain_filter with all gains 1.0 is the identity
+     max |diff| 1.11e-16  (<1e-9)  [V]
+
+SC2  POSITIVE -- a purely spectral loss (blur) must trip FS9
+
+  FS9  spectral twin -- input attenuated by the model's own losses
+       band            captured   implied amplitude gain
+         1.0 -   2.0     0.996           0.941
+         2.0 -   4.0     0.991           0.905
+         4.0 -   8.0     0.894           0.674
+         8.0 -  16.0     0.438           0.250
+
+       MSE(recon, input)  0.002322   <- what the model loses
+       MSE(twin,  recon)  0.000124   <- what is left over
+    FS9 ratio 0.054 < 0.30   [V]
+        [V] => the softness IS the whole story.  Nothing is
+        misplaced in space; the model is at its information ceiling
+        for this canvas.  More pixels on the face is the only fix.
+        [K] => there is spatial error the radial spectrum hides.
+     -> must be V  [V]
+
+SC3  NEGATIVE -- a SPATIAL corruption must NOT trip FS9
+
+  FS9  spectral twin -- input attenuated by the model's own losses
+       band            captured   implied amplitude gain
+         1.0 -   2.0     0.971           0.830
+         2.0 -   4.0     0.944           0.764
+         4.0 -   8.0     0.851           0.614
+         8.0 -  16.0     0.665           0.421
+
+       MSE(recon, input)  0.001074   <- what the model loses
+       MSE(twin,  recon)  0.001571   <- what is left over
+    FS9 ratio 1.463 < 0.30   [K]
+        [V] => the softness IS the whole story.  Nothing is
+        misplaced in space; the model is at its information ceiling
+        for this canvas.  More pixels on the face is the only fix.
+        [K] => there is spatial error the radial spectrum hides.
+     -> must be K  [V]
+
+SELFTEST ALL [V]
+
+E:\DocsHouse\893 tinyavatar4>python3.13 sharpness_ceiling.py --data faces1 --n 64 --model runs/tiny2/model5_constQ.pt
+loaded 64 frames at 128px; moving region 19.5% of canvas
+
+  FS10 how many pixels is the face?
+       moving-region bounding box: 116 x 102 px on a 128px canvas
+       face occupies 91% of the frame width
+       eye width ~1/5 face         23.2 px
+       iris ~1/12 face              9.6 px
+       eyelid line ~1/50 face       2.3 px
+       a tight crop would make the face ~109px wide  =  0.9x linear
+       Detail below ~2px cannot exist in the data, so no basis,
+       latent or loss can put it in the render.
+  trainer module: splat_trainer5
+
+  FS9  spectral twin -- input attenuated by the model's own losses
+       band            captured   implied amplitude gain
+         1.0 -   2.0     0.999           0.969
+         2.0 -   4.0     0.993           0.915
+         4.0 -   8.0     0.979           0.855
+         8.0 -  16.0     0.942           0.759
+        16.0 -  32.0     0.861           0.628
+
+       MSE(recon, input)  0.001429   <- what the model loses
+       MSE(twin,  recon)  0.001916   <- what is left over
+    FS9 ratio 1.340 < 0.30   [K]
+        [V] => the softness IS the whole story.  Nothing is
+        misplaced in space; the model is at its information ceiling
+        for this canvas.  More pixels on the face is the only fix.
+        [K] => there is spatial error the radial spectrum hides.
+
+  wrote ceiling_strip.png  (input | model recon | spectral twin)
+  If columns 2 and 3 are indistinguishable, the model is doing
+  exactly and only what the measured band attenuation says.
+
+E:\DocsHouse\893 tinyavatar4>
