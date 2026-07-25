@@ -131,6 +131,25 @@ except ImportError:
     load_model = packet_amp = grab_weights = render_from_params = None
 
 
+def _dev(model):
+    """The device the model actually lives on.
+
+    Every tensor this module creates from scratch must inherit it.  A bare
+    torch.ones / torch.eye / torch.tensor defaults to CPU, and the moment it
+    meets a CUDA tensor PyTorch raises 'Expected all tensors to be on the
+    same device'.  That is not cosmetic: callers catch it, silently fall back
+    to a weaker basis, and print a warning naming the wrong cause.
+
+    The FIRST crash on a CUDA model was build_control_basis's bg_gate, which
+    runs before any PinDriver exists — so patching the solver's torch.eye
+    calls (the obvious suspects) fixes lines that never execute.
+    """
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
 def _need():
     if ST is None:
         sys.exit("pin_driver.py needs splat_trainer5.py, splat_trainer3v2.py "
@@ -185,7 +204,7 @@ def build_control_basis(model, z_anchor, k=24, grid=8, r_grab=0.10,
     raw = model.dec(z_anchor[None]).float()
     px, py, sg, th, fr, cf = model.ren.activate(raw)
     amp = packet_amp(cf)
-    bg_gate = torch.ones(N)
+    bg_gate = torch.ones(N, device=_dev(model))
 
     def clusters(points):
         out = []
@@ -258,7 +277,7 @@ class PinDriver:
         self.lam, self.beta = lam, beta
         self.step_clip, self.iters = step_clip, iters
         self.dim = 128 if V is None else V.shape[1]
-        self.a = torch.zeros(self.dim)
+        self.a = torch.zeros(self.dim, device=next(model.parameters()).device)
         self.weights, self.c_ref, self.lm_ref = [], None, None
 
     # ---- state
@@ -276,7 +295,8 @@ class PinDriver:
         raw = self.m.dec(z[None]).float()
         px, py, sg, th, fr, cf = self.m.ren.activate(raw)
         amp = packet_amp(cf)
-        gate = torch.ones(self.m.ren.N)
+        dev = _dev(self.m)
+        gate = torch.ones(self.m.ren.N, device=dev)
         ws, cs, lms = [], [], []
         for (u, v) in landmarks:
             w = grab_weights(px, py, sg, amp, (float(u), float(v)),
@@ -290,15 +310,17 @@ class PinDriver:
             return False
         self.weights = ws
         self.c_ref = torch.stack(cs)
-        self.lm_ref = torch.tensor(lms, dtype=torch.float32)
+        self.lm_ref = torch.tensor(lms, dtype=torch.float32, device=dev)
         return True
 
     # ---- per-frame solve
     def step(self, landmarks, gain=1.0):
         """Returns (z, pin_err_px).  landmarks must match calibration order."""
+        dev = _dev(self.m)
         if not self.weights:
             return self.z(), 0.0
-        lm = torch.tensor(np.asarray(landmarks, dtype=np.float32)[:len(self.weights)])
+        dev = next(self.m.parameters()).device
+        lm = torch.tensor(np.asarray(landmarks, dtype=np.float32)[:len(self.weights)], device=dev)
         tgt = self.c_ref + gain * (lm - self.lm_ref)
         tgt = tgt.clamp(0.02, 0.98)
 
@@ -315,11 +337,12 @@ class PinDriver:
             px, py, *_ = self.m.ren.activate(raw)
             c_now = torch.stack([centroid(w, px, py) for w in self.weights])
             e = (tgt - c_now).reshape(-1)
-            JJt = J @ J.T + (self.lam ** 2) * torch.eye(J.shape[0])
-            K = J.T @ torch.linalg.solve(JJt, torch.eye(J.shape[0]))
+            dev = J.device
+            JJt = J @ J.T + (self.lam ** 2) * torch.eye(J.shape[0], device=dev)
+            K = J.T @ torch.linalg.solve(JJt, torch.eye(J.shape[0], device=dev))
             da = K @ e
             if self.beta > 0:
-                P = torch.eye(J.shape[1]) - K @ J
+                P = torch.eye(J.shape[1], device=dev) - K @ J
                 da = da + P @ (-self.beta * self.a)
             n = da.norm()
             if n > self.step_clip:
@@ -418,21 +441,22 @@ def _bg_motion(model, z_a, z_b, ring_w):
 
 def selftest():
     _need()
-    print("SELFTEST — machinery only. A random decoder has no manifold; these "
+    print(f"SELFTEST — machinery only. device={_dev(_tiny())}. A random decoder has no manifold; these "
           "results certify the solver and the projection, nothing about a "
           "trained model.")
     m = _tiny()
-    z0 = torch.randn(128) * 0.5
+    z0 = torch.randn(128, device=_dev(m)) * 0.5
     V, S, info = build_control_basis(m, z0, k=12, grid=5, bg_drop=2,
                                      verbose=False)
 
-    ok_a = float((V.T @ V - torch.eye(V.shape[1])).abs().max()) < 1e-5
+    ok_a = float((V.T @ V - torch.eye(V.shape[1],
+                 device=V.device)).abs().max()) < 1e-5
     print(f"PD0a basis orthonormality        {'[V]' if ok_a else '[K]'}")
 
     raw = m.dec(z0[None]).float()
     px, py, sg, th, fr, cf = m.ren.activate(raw)
     amp = packet_amp(cf)
-    gate = torch.ones(m.ren.N)
+    gate = torch.ones(m.ren.N, device=_dev(m))
     kbest = int(amp[0].argmax())
     lm = np.array([[float(px[0, kbest]), float(py[0, kbest])]],
                   dtype=np.float32)
@@ -499,17 +523,18 @@ def gates(args):
     torch.manual_seed(args.seed)
     ratios, errs = [], []
     for s in range(args.samples):
-        z0 = torch.randn(128) * 0.8
+        z0 = torch.randn(128, device=_dev(m)) * 0.8
         V, sv, info = build_control_basis(m, z0, k=args.k, grid=args.grid,
                                           bg_drop=args.bg_drop,
                                           verbose=(s == 0))
         if s == 0:
-            ok_a = float((V.T @ V - torch.eye(V.shape[1])).abs().max()) < 1e-5
+            ok_a = float((V.T @ V - torch.eye(V.shape[1],
+                 device=V.device)).abs().max()) < 1e-5
             print(f"PD0a basis orthonormality  {'[V]' if ok_a else '[K]'}")
 
         raw = m.dec(z0[None]).float()
         px, py, sg, th, fr, cf = m.ren.activate(raw)
-        amp = packet_amp(cf); gate = torch.ones(m.ren.N)
+        amp = packet_amp(cf); gate = torch.ones(m.ren.N, device=_dev(m))
         lm = np.array([[0.36, 0.42], [0.64, 0.42]], np.float32)
         ring = [(0.06, 0.5), (0.94, 0.5), (0.5, 0.06), (0.5, 0.94),
                 (0.10, 0.10), (0.90, 0.90), (0.10, 0.90), (0.90, 0.10)]
@@ -545,7 +570,7 @@ def gates(args):
           f"median pin err {np.median(errs):.2f} px  {'[V]' if ok1 else '[K]'}")
 
     # PD2 rate
-    z0 = torch.randn(128) * 0.8
+    z0 = torch.randn(128, device=_dev(m)) * 0.8
     V, _, _ = build_control_basis(m, z0, k=args.k, grid=args.grid,
                                  bg_drop=args.bg_drop, verbose=False)
     d = PinDriver(m, z0, V, iters=args.frame_iters)
@@ -580,13 +605,14 @@ def live(args):
             return np.clip((x - mu) / sd * tgt_std + tgt_mean, 0, 1)
 
     torch.manual_seed(args.seed)
-    z_anchor = torch.randn(128) * 0.8
+    z_anchor = torch.randn(128, device=_dev(m)) * 0.8
     if args.image:
         import cv2 as _c
         im = _c.imread(args.image)
         if im is not None:
             im = _c.cvtColor(_c.resize(im, (S, S)), _c.COLOR_BGR2RGB)
-            x = torch.from_numpy(im).float().permute(2, 0, 1)[None] / 255.0
+            x = torch.from_numpy(im).float().permute(
+                2, 0, 1)[None].to(_dev(m)) / 255.0
             z_anchor = m.enc(x)[0][0]
 
     V, sv, info = build_control_basis(m, z_anchor, k=args.k, grid=args.grid,
@@ -626,7 +652,8 @@ def live(args):
         if use_enc:
             x = cv.resize(crop, (S, S))[:, :, ::-1].astype(np.float32) / 255.0
             x = normalize_crop(x)
-            xt = torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1)))[None]
+            xt = torch.from_numpy(np.ascontiguousarray(
+                x.transpose(2, 0, 1)))[None].to(_dev(m))
             z = m.enc(xt)[0][0]
         else:
             if lm is not None and not calibrated:
