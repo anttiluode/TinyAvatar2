@@ -3,7 +3,8 @@
 EDIT: Added manifold flow which tries to use the tinyavatar model AND 
 stable diffusion turbo. (It loads it from huggingface if you do not have it). 
 Sort of harebrained idea. I used it on a model made of myself and then manual 
-box to fit the tiny avatar and live webcam windows together. 
+box to fit the tiny avatar and live webcam windows together. It can use haar 
+cascade but you do not really need it. 
 
 EDIT: Added the TroubleShootingFaceSharpness sub folder where we thought about 
 the issue. I think resolution and dataset quality has a lot to do with it. The 
