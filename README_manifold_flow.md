@@ -373,6 +373,92 @@ point**. The prediction worth testing is that SDXL-Turbo will *not* — diffusio
 injects fresh high-frequency content on every pass, which is exactly what a
 fixed point cannot survive. That is unmeasured.
 
+## Does dream strength = 1.0 use the avatar at all?
+
+Sharp question, and the honest answer needed the real diffusers scheduler math,
+not a guess. Checked directly against `EulerAncestralDiscreteScheduler` with
+SDXL's actual beta schedule.
+
+**Short answer: at strength 1.00, no — not the avatar's *pixels*.** img2img
+works by adding noise to the input latent up to a starting timestep set by
+`strength`, then denoising from there. At `strength = 1.0` that starting point
+is the single noisiest timestep in the schedule (σ ≈ 14.6), where the signal
+fraction is `1/(1+σ²)`:
+
+```
+strength 1.00  ->  0.47%  of the structure image survives
+```
+
+The "structure image" is the blend of webcam and avatar render that `structure`
+and `gravity` control. At 0.47% retained, that blend is statistically noise to
+SDXL. **This is functionally text-to-image** — the avatar's render, and the
+webcam, are both being discarded before the model ever sees them.
+
+### The bug this uncovered: the step formula was a knife-edge, not a dial
+
+It's worse than "high strength ignores the image." The app derived step count
+as `steps = 2.0 / strength`, and that interacts with `strength` in the SAME
+formula that sets the starting timestep — so two adjacent slider positions
+could land at *opposite* extremes:
+
+| strength | old steps | retained |
+|---|---|---|
+| 1.00 | 2 | **0.47%** |
+| 0.90 | 2 | **99.91%** |
+| 0.74 | 2 | 99.91% |
+| 0.50 | 4 | 53.50% |
+| 0.33 | 6 | 99.91% |
+| 0.20 | 10 | 88.04% |
+
+Moving the slider from 1.00 to 0.90 didn't turn the dial down — it flipped from
+"discard almost everything" to "discard almost nothing," a 99-point jump on one
+tick. There was no strength setting that gave a moderate, controllable blend.
+
+**Fixed:** step count is now a fixed value (default 4), independent of
+strength, with its own slider. Retention now moves smoothly:
+
+| strength | fixed steps | retained |
+|---|---|---|
+| 1.00 | 4 | 0.47% |
+| 0.90 | 4 | 10.51% |
+| 0.74 | 4 | 53.50% |
+| 0.50 | 4 | 53.50% |
+| 0.33 | 4 | 99.91% |
+| 0.20 | 4 | 100.00% |
+
+**SS1 [V]** — gate: the old formula has a jump over 90 percentage points
+somewhere in that range; the fixed formula's biggest jump is under 70. Measured
+99pp vs 46pp.
+
+The status bar now shows **structure retained N%** live, computed from the
+actual (steps, strength) pair each time a dream fires, so this is no longer
+something you have to take on faith.
+
+### So what *is* the avatar doing at strength 1.0?
+
+Not nothing — its role just isn't what "Manifold share of structure" implies at
+that setting. Four things survive regardless of strength, because none of them
+route through the noised structure image:
+
+* **The gate** — novelty, drift, residual, all computed from `z`, decide *when*
+  a redream fires.
+* **The motion field** — transports the standing dream between redreams, read
+  off the decoder, independent of what the last diffusion call painted.
+* **The coverage mask** — `manifold_coverage()` decides *where* the diffusion
+  output gets composited onto the canvas.
+* **In the loop**, the avatar is *what encodes the diffusion's own output* —
+  the thing that turns the loop into a closed system at all.
+
+What does **not** survive at strength 1.0: the avatar's specific rendered
+appearance influencing what SDXL paints. At that setting SDXL is free-running on
+the prompt, encoded and gated by the avatar but not looking at it.
+
+This also sharpens the 2-manifold-loop finding (`README_two_manifold_loop.md`):
+the attractor lock happens *even though* the structure channel is voided at
+`strength = 1.0`. The coupling that produces the lock is not visual
+conditioning — it's the motion field, the gate, and the mask, operating on a
+diffusion model that is otherwise seeing only the prompt.
+
 ## Loading a different avatar model
 
 **Load avatar model...** in the sidebar opens any `.pt` checkpoint from the

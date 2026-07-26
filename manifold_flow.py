@@ -671,7 +671,7 @@ class StubDream:
     def __init__(self, **kw):
         self.ready = True
 
-    def __call__(self, img_rgb, prompt, strength):
+    def __call__(self, img_rgb, prompt, strength, steps=4):
         # zlib.crc32, not hash(): Python randomises string hashing per process
         # (PYTHONHASHSEED), so hash() made this stub a DIFFERENT function on
         # every run. Caught by the loop probe, whose trajectory refused to
@@ -694,6 +694,34 @@ class StubDream:
         return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def timestep_retention(steps, strength):
+    """What fraction of the INPUT IMAGE's signal survives diffusers' img2img
+    noising step, for a given (steps, strength) pair.
+
+    This is the exact mechanism, not an approximation: img2img computes
+    t_start = steps - min(int(steps*strength), steps), then does
+    scheduler.add_noise(input_latent, noise, timesteps[t_start]), which for a
+    Euler-family scheduler is  noisy = input + sigma[t_start] * noise. Signal
+    power fraction is therefore 1 / (1 + sigma^2). At strength=1.0, t_start=0
+    and sigma is the schedule's maximum (~14.6 for SDXL's default betas) --
+    0.47% of the input survives, i.e. img2img at strength 1.0 is ~txt2img.
+    Requires diffusers; returns None (not an error) if it is not installed,
+    since this is diagnostic and must never block the app or --selftest.
+    """
+    try:
+        from diffusers.schedulers import EulerAncestralDiscreteScheduler
+    except ImportError:
+        return None
+    sch = EulerAncestralDiscreteScheduler(
+        num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012,
+        beta_schedule="scaled_linear", prediction_type="epsilon")
+    sch.set_timesteps(steps)
+    init = min(int(steps * strength), steps)
+    t_start = max(steps - init, 0)
+    sigma = float(sch.sigmas[t_start])
+    return 1.0 / (1.0 + sigma ** 2)
+
+
 class SDXLTurbo:
     name = "sdxl-turbo"
 
@@ -708,9 +736,20 @@ class SDXLTurbo:
         self.pipe.set_progress_bar_config(disable=True)
         self.ready = True
 
-    def __call__(self, img_rgb, prompt, strength):
+    def __call__(self, img_rgb, prompt, strength, steps=4):
         from PIL import Image
-        steps = max(2, min(50, int(2.0 / max(0.01, strength))))
+        # steps is now FIXED, not derived from strength. Deriving it as
+        # int(2.0/strength) was a knife-edge, not a dial -- see
+        # timestep_retention() below and README_manifold_flow.md ("does
+        # strength=1 use the avatar at all"). At strength=1.0 with that
+        # formula, steps=2 and img2img starts at the noisiest timestep,
+        # discarding ~99.5% of the input's signal (measured against the real
+        # SDXL/Turbo scheduler math). At strength=0.90 with the SAME formula,
+        # steps was ALSO 2, but strength*steps rounds down to 1, so it starts
+        # at the almost-clean end instead -- 99.9% RETAINED, a near no-op. The
+        # two settings looked one slider-tick apart and were opposite
+        # extremes. A fixed step count makes retention move smoothly with
+        # strength instead of flipping between the two ends.
         out = self.pipe(prompt=prompt, image=Image.fromarray(img_rgb),
                         strength=strength, guidance_scale=0.0,
                         num_inference_steps=steps).images[0]
@@ -742,12 +781,12 @@ class DreamEngine:
         self.t = threading.Thread(target=self._loop, daemon=True)
         self.t.start()
 
-    def request(self, img_rgb, prompt, strength, z):
+    def request(self, img_rgb, prompt, strength, z, steps=4):
         with self.lock:
             if self.busy:
                 return False
             self.req = (img_rgb.copy(), prompt, float(strength),
-                        np.asarray(z, np.float32).copy())
+                        np.asarray(z, np.float32).copy(), int(steps))
             self.busy = True
             self.pending[:] = 0.0
         self.ev.set()
@@ -775,10 +814,10 @@ class DreamEngine:
                 self.req = None
             if req is None:
                 continue
-            img, prompt, strength, z = req
+            img, prompt, strength, z, steps = req
             t0 = time.time()
             try:
-                out = self.backend(img, prompt, strength)
+                out = self.backend(img, prompt, strength, steps=steps)
             except Exception as e:
                 print("dream error:", e)
                 out = img
@@ -816,7 +855,7 @@ class FlowPipeline:
             mask_source="manifold",   # "box" (Haar ellipse) or "manifold"
             measure_every=6,
             loop=False, loop_drive=0.59, lockstep=True, render_fill=0.62,
-            loop_anchor=0.50,
+            loop_anchor=0.50, diffusion_steps=4,
         )
         if cfg:
             self.cfg.update(cfg)
@@ -836,6 +875,7 @@ class FlowPipeline:
         self._anchor_prev = None
         self._anchor_acc = np.zeros(2, np.float64)
         self._anchor_win = None
+        self._retention = None
 
     # -- latent smoothing ---------------------------------------------------
     # -- 2-manifold loop ----------------------------------------------------
@@ -856,6 +896,7 @@ class FlowPipeline:
         self._anchor_prev = None
         self._anchor_acc = np.zeros(2, np.float64)
         self._anchor_win = None
+        self._retention = None
         self.gate.z_key = None
         return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
@@ -957,6 +998,7 @@ class FlowPipeline:
         self._anchor_prev = None
         self._anchor_acc = np.zeros(2, np.float64)
         self._anchor_win = None
+        self._retention = None
         self.gate = ManifoldGate(self.gate.novelty_t, self.gate.drift_t,
                                  self.gate.max_reuse, self.gate.res_k)
         self._prompt_seen = None
@@ -1041,6 +1083,7 @@ class FlowPipeline:
         prompt_changed = (self.cfg["prompt"] != self._prompt_seen)
         if self.gate.should_fire(z_np, prompt_changed):
             structure = self._structure(frame_bgr, rend, box, (H, W), st)
+            steps = int(self.cfg["diffusion_steps"])
             if self.cfg["loop"] and self.cfg["lockstep"]:
                 # LOCKSTEP. In the loop the image model is INSIDE the feedback
                 # path, so running it on its own thread makes the number of
@@ -1054,7 +1097,8 @@ class FlowPipeline:
                 t0 = time.time()
                 try:
                     self.dream = self.eng.backend(
-                        structure, self.cfg["prompt"], self.cfg["strength"])
+                        structure, self.cfg["prompt"], self.cfg["strength"],
+                        steps=steps)
                 except Exception as e:
                     print("dream error:", e)
                 self.eng.ms = (time.time() - t0) * 1000
@@ -1062,11 +1106,15 @@ class FlowPipeline:
                 self._prompt_seen = self.cfg["prompt"]
                 self.gate.armed(z_np)
                 self.fired += 1
+                self._retention = timestep_retention(steps,
+                                                     self.cfg["strength"])
             elif self.eng.request(structure, self.cfg["prompt"],
-                                  self.cfg["strength"], z_np):
+                                  self.cfg["strength"], z_np, steps=steps):
                 self._prompt_seen = self.cfg["prompt"]
                 self.gate.armed(z_np)
                 self.fired += 1
+                self._retention = timestep_retention(steps,
+                                                     self.cfg["strength"])
 
         # ---- collect a finished dream
         got = self.eng.take()
@@ -1099,6 +1147,7 @@ class FlowPipeline:
             flicker=float(np.mean(self.flicker)) if self.flicker else 0.0,
             face=self.framer.found, dreams=self.eng.count,
             zn=float(np.linalg.norm(z_np)), hf=self._hf,
+            retention=self._retention,
             **self._regime_report(),
         )
         return dict(out=out, render=rend, flow=flow, crop=crop_img)
@@ -1484,6 +1533,20 @@ def selftest():
     ok.append(_chk("T18b NEGATIVE: with the anchor off the drift is present",
                    d_off > 15.0, f"{d_off:.1f}px"))
 
+    # T19 -- timestep_retention: gracefully absent without diffusers, and
+    # when diffusers IS present, the qualitative shape must be right: near-
+    # zero retained at strength 1, near-total retained at low strength.
+    ret_hi = timestep_retention(4, 1.00)
+    ret_lo = timestep_retention(4, 0.20)
+    if ret_hi is None:
+        ok.append(_chk("T19 timestep_retention absent gracefully "
+                       "(diffusers not installed)", ret_lo is None))
+    else:
+        ok.append(_chk("T19a strength=1.0 retains almost none of the input",
+                       ret_hi < 0.02, f"{ret_hi*100:.2f}%"))
+        ok.append(_chk("T19b NEGATIVE: low strength retains almost all of it",
+                       ret_lo > 0.95, f"{ret_lo*100:.2f}%"))
+
     # T8 -- stub backend determinism
     s = StubDream()
     img8 = (np.random.RandomState(1).rand(64, 64, 3) * 255).astype(np.uint8)
@@ -1685,7 +1748,7 @@ def gates(args):
         name = "identity"
         def __init__(self):
             self.ready = True
-        def __call__(self, img_rgb, prompt, strength):
+        def __call__(self, img_rgb, prompt, strength, steps=4):
             return img_rgb
 
     rows = {}
@@ -1726,7 +1789,7 @@ def gates(args):
     class _Creep:
         name = "creep"
         ready = True
-        def __call__(self, img, prompt, strength):
+        def __call__(self, img, prompt, strength, steps=4):
             M = np.float32([[1, 0, 1.2], [0, 1, 1.2]])
             return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]),
                                   borderMode=cv2.BORDER_REPLICATE)
@@ -1781,7 +1844,7 @@ def gates(args):
     class _Pass2:
         name = "identity"
         ready = True
-        def __call__(self, img, prompt, strength):
+        def __call__(self, img, prompt, strength, steps=4):
             return img
 
     def _spread(V):
@@ -1828,12 +1891,52 @@ def gates(args):
     print(f"     n={K} and the STUB image model; the figure that matters is")
     print("     this same run under SDXL-Turbo with his own prompt.")
 
+    # ---------------------------------------------------------------- SS1
+    print("\nSS1  does the diffusion step formula give a smooth structure dial?")
+    print("     answers his question directly: at dream strength=1, does the")
+    print("     tiny avatar's structure image survive into what SDXL sees?")
+    ret = timestep_retention(4, 1.0)
+    if ret is None:
+        print("     SS1 SKIPPED -- diffusers not installed. pip install "
+              "diffusers to score this (no model download needed, only the "
+              "scheduler class).")
+        ss1 = None
+    else:
+        print("     strength  OLD(2/strength)  retained   FIXED(4 steps)  retained")
+        old_vals, new_vals = [], []
+        for st in (1.00, 0.90, 0.74, 0.50, 0.33, 0.20):
+            old_steps = max(2, min(50, int(2.0 / max(0.01, st))))
+            r_old = timestep_retention(old_steps, st)
+            r_new = timestep_retention(4, st)
+            old_vals.append(r_old); new_vals.append(r_new)
+            print(f"       {st:.2f}         {old_steps:2d} steps   {r_old*100:6.2f}%    "
+                  f"  4 steps      {r_new*100:6.2f}%")
+        # the OLD formula is near-binary: consecutive strengths differ hugely
+        old_jumps = [abs(old_vals[i] - old_vals[i + 1])
+                    for i in range(len(old_vals) - 1)]
+        new_jumps = [abs(new_vals[i] - new_vals[i + 1])
+                    for i in range(len(new_vals) - 1)]
+        ss1 = max(old_jumps) > 0.9 and max(new_jumps) < 0.7
+        print(f"     largest single-tick jump: old {max(old_jumps)*100:.0f}pp  "
+              f"new {max(new_jumps)*100:.0f}pp")
+        print(f"     SS1 [{'V' if ss1 else 'K'}]  gate: old formula has a >90pp "
+              f"jump somewhere, fixed formula's biggest jump is <70pp")
+        print(f"     DIRECT ANSWER: at strength=1.00, {ret*100:.2f}% of the")
+        print("     structure image survives -- the avatar's render and the")
+        print("     webcam are both functionally noise to the diffusion model.")
+        print("     The avatar still drives WHEN a redream fires (the gate),")
+        print("     what the standing dream looks like BETWEEN redreams (the")
+        print("     motion field), and where the output gets composited (the")
+        print("     coverage mask) -- but at strength=1.0 it is not visually")
+        print("     informing what SDXL paints.")
+
     print("\nVERDICT")
     print(f"  MF1 {'[V]' if mf1 else '[K]'}   "
           f"MF2 {'[V]' if mf2 else ('[K]' if mf2 is False else 'UNMEASURED')}   "
           f"MF3 live-only   MF4 {'[V]' if mf4 else '[K]'}   "
           f"DM1 {'[V]' if dm1 else '[K]'}   LP1 {'[V]' if lp1 else '[K]'}   "
-          f"AD1 {'[V]' if ad1 else '[K]'}   LK1 {'[V]' if lk1 else '[K]'}")
+          f"AD1 {'[V]' if ad1 else '[K]'}   LK1 {'[V]' if lk1 else '[K]'}   "
+          f"SS1 {('[V]' if ss1 else '[K]') if ss1 is not None else 'SKIPPED'}")
     return 0
 
 
@@ -2017,6 +2120,28 @@ def live(args):
             slider(gdl, "strength", 0.10, 1.00, 1.00, "Dream strength")
             slider(gdl, "gravity", 0.00, 0.99, 0.00, "Feedback gravity")
             slider(gdl, "sharpness", 0.00, 2.00, 0.00, "Crystallizer")
+            gslider2 = QtWidgets.QWidget(); gslider2.setMinimumHeight(48)
+            v2 = QtWidgets.QVBoxLayout(gslider2)
+            v2.setContentsMargins(0, 0, 0, 0); v2.setSpacing(3)
+            self._steps_lab = QtWidgets.QLabel("Diffusion steps  4")
+            self._steps_lab.setObjectName("cap")
+            sstp = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            sstp.setMinimum(1); sstp.setMaximum(12); sstp.setValue(4)
+            def _on_steps(x):
+                pipe.cfg["diffusion_steps"] = x
+                self._steps_lab.setText(f"Diffusion steps  {x}")
+            sstp.valueChanged.connect(_on_steps)
+            v2.addWidget(self._steps_lab); v2.addWidget(sstp)
+            gdl.addWidget(gslider2)
+            shint = QtWidgets.QLabel(
+                "FIXED step count, independent of dream strength. The old "
+                "'steps = 2/strength' formula was a knife-edge: at strength "
+                "1.00 it started img2img from the noisiest timestep and "
+                "discarded ~99.5% of the input (measured against the real "
+                "SDXL scheduler); one tick lower it discarded almost none. "
+                "See 'structure retained' in the status bar.")
+            shint.setObjectName("cap"); _wrap(shint)
+            gdl.addWidget(shint)
             slider(gdl, "structure", 0.00, 1.00, 0.33,
                    "Manifold share of structure")
             side.addWidget(gd)
@@ -2352,7 +2477,9 @@ def live(args):
                 f"residual {t['residual']:.4f}"
                 f"{'  OFF-MANIFOLD' if t['off'] else ''}  |  "
                 f"last fire: {t['reason']}  |  flicker {t['flicker']:.2f}  "
-                f"added HF {t['hf']*100:.0f}% (geom~2 detail~22)  "
+                f"added HF {t['hf']*100:.0f}% (geom~2 detail~22)  " +
+                (f"structure retained {t['retention']*100:.1f}%  "
+                 if t.get('retention') is not None else "") +
                 f"|z| {t['zn']:.2f}  " +
                 (f"LOOP: {t['regime']}  step {t['step']:.3f}  "
                  f"net/path {t['ratio']:.2f}" if pipe.cfg["loop"]

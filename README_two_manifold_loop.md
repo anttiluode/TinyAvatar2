@@ -176,6 +176,48 @@ cheap enough to find out.
 
 ---
 
+## Revision: the lock is not visual conditioning
+
+A direct follow-up question — "does dream strength 1.0 use the avatar model at
+all" — forced a check of the real diffusers scheduler math, and it changes what
+LK1 means.
+
+**At `strength = 1.0` (the working default), img2img discards 99.5% of its
+input's signal before the model ever sees it** — confirmed against
+`EulerAncestralDiscreteScheduler`'s actual noise schedule, not assumed. See
+`README_manifold_flow.md` for the full derivation. The "structure" image — the
+blend of avatar render and prior dream that `structure` and `gravity` control —
+is statistically noise to SDXL at that setting.
+
+So the lock LK1 measures is **not** the avatar's appearance steering the
+diffusion model, and diffusion's output steering the avatar in turn, in a
+genuine two-way visual exchange. The channel that actually closes the loop at
+`strength = 1.0` is narrower than that:
+
+* the avatar **gates** when a redream fires (novelty/drift/residual on `z`)
+* the avatar **masks** where the diffusion output lands on the canvas
+* the avatar **encodes** the diffusion's own last output back into `z` — the
+  thing that makes it a closed system at all
+* SDXL, meanwhile, is close to free-running on the prompt alone
+
+The attractor is real — LK1's contraction number does not change — but the
+"intersection of two priors" framing above overstates the visual coupling.
+It is closer to: **a fixed prompt, repeatedly regenerated, with a small closed
+model deciding the timing and placement of each regeneration and folding the
+result back into its own coordinate system.** That is a real dynamical system
+and a real lock. It is just not the two models looking at each other that it
+first appeared to be.
+
+This does not weaken use #1 (measuring a composed prior) — if anything it
+sharpens it: the joint mode being sampled is closer to *SDXL's own prior for
+the prompt*, filtered through the avatar's gating and masking rhythm, rather
+than a blend of two models' visual content. Whether the avatar's appearance
+matters at all is now a clean, answerable experiment: drop `strength` to
+somewhere the retention table shows real signal survival (the fixed-step
+formula makes 0.50–0.74 a genuine partial blend now, see the other README) and
+rerun LK1. If the attractor changes, the avatar's pixels were doing something.
+If it doesn't, they weren't.
+
 ## What is not established
 
 * Every loop figure here is the **stub** image model, not SDXL-Turbo. The stub
