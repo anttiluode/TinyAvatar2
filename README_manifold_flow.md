@@ -207,6 +207,202 @@ The screenshot read `face NO`, `residual 0.1111`, permanent `OFF-MANIFOLD`,
    of the thing the manifold believes is there rather than of an ellipse, and it
    scales with the packets — lean back and it shrinks by itself.
 
+## 2 Manifold Loop (no webcam)
+
+Remove the camera and close the ring. The avatar manifold encodes the
+diffusion's last image; the diffusion paints over the avatar's render and
+motion field. Nothing external enters anywhere.
+
+```
+        ┌────────────────────────────────────────────┐
+        │                                            │
+   dream_{t-1} ──crop──▶ enc ──▶ z_t ──▶ dec ──▶ render + field
+        ▲                                            │
+        │                                            ▼
+        └──────── SDXL-Turbo( structure, prompt ) ◀───┘
+```
+
+It is a closed dynamical system — two generative models each taking the
+other's output as input — so the app names what it is doing rather than
+leaving you to guess: **FIXED POINT** (the pair agreed on an image that
+survives a round trip), **CYCLE ~N**, or **WANDER**. A frozen picture here is
+a result, not a hang.
+
+**Loop drive** defaults to **0.00**, which means nothing at all is injected and
+anything that moves is the coupling. Turning it up adds a slow, deterministic,
+band-limited latent perturbation — a few incommensurate sinusoids, not white
+noise, precisely so that whatever structure appears cannot be blamed on the
+injection.
+
+### The lock, measured — LK1
+
+Started from K different points on the avatar manifold, let settle, compare the
+spread of the endpoints to the spread of the starting points:
+
+| arm | start spread | attractor spread | contraction |
+|---|---|---|---|
+| full loop | 6.63 | **1.95** | **0.293** |
+| image step → pass-through | 6.63 | 6.00 | 0.905 |
+
+**LK1 [V]** — the pair is a strong contraction; the avatar alone is not. Points
+6.6 apart in latent space finish 1.9 apart, so the starting point mostly does
+not matter. That is the "it locks into one tight face" observation as a number.
+See `README_two_manifold_loop.md` for what the locking might be worth.
+
+### LP1 — is it actually coupled?
+
+The null worth ruling out is that the avatar just relaxes to its own fixed
+point and the picture is one model talking to itself.
+
+| arm | mean step | regime |
+|---|---|---|
+| full loop | 0.147 | WANDER |
+| image step replaced by a pass-through | 0.000 | FIXED POINT |
+
+**LP1 [V]** — the avatar alone comes to a dead stop; the image model is what
+keeps the latent alive.
+
+**Recorded revision.** With the working default of `structure = 0.33` this
+control arm stopped being a null: the structure paste puts the avatar's own
+render into the image path independent of the image model, so the "control" was
+itself a coupled loop through a second channel and the contrast collapsed from
+23× to 2.0×. Both arms now run at `structure = 0`, which is what makes this a
+test of the image model rather than of the paste.
+
+**Caveat:** this runs the stub image model, not SDXL-Turbo. It establishes that
+the architecture is closed and where the motion comes from. Magnitude and
+regime under real diffusion are unmeasured.
+
+### The loop drifted down-right and the head shrank — two causes, neither the field
+
+Diagnosed by replacing diffusion with **identity**, so the only thing acting on
+the image was the crop → encode → field → warp → paste chain. Any motion of a
+static marker is then bias in the pipeline, not the image model.
+
+**The motion field was innocent.** Turning it off entirely (`field_gain 0`)
+changed the drift by less than a thousandth. Mean flow per frame: 0.0000 px.
+
+**Cause 1 — the structure paste was asserting a position and a size.** The
+render was dropped into the box rectangle, which silently says "the face is
+here, and this big". In a closed loop that nudge *integrates*. Measured over 50
+passes with identity diffusion, and it scaled cleanly with the structure share:
+
+| structure | centroid drift | radius |
+|---|---|---|
+| 0.00 | 0.0000 | 1.000× |
+| 0.07 | +0.0031 | 1.106× |
+| 0.14 | +0.0171 | 1.228× |
+| 0.40 | +0.0284 | 1.759× |
+
+Fix: `_paste_render()` measures the render's *own* coverage centroid and RMS
+radius (`coverage_geometry`), then places it so the centroid lands on the box
+centre and the radius is a fixed fraction of the box (`render_fill`, default
+0.62). The paste geometry now depends only on the box and one constant, so with
+a fixed box nothing integrates — the loop settles to a fixed point instead of
+marching. At structure 0.40 the centroid now parks at (0.471, 0.524) and the
+radius at 0.354, flat from pass 200 onward.
+
+**Cause 2 — the crop was not square at a frame edge.** `FaceFramer` clipped the
+box against the edge and handed the surviving rectangle to `cv2.resize`, which
+squashed it to the encoder's square input. Measured: aspect **0.690** at
+x = 0.90, **1.623** at y = 0.92. The encoder then saw a face stretched by up to
+1.6×, so the render was stretched, so the paste stretched the image further —
+positive feedback that only fires when the face reaches an edge. With a webcam
+it almost never does; in the closed loop it does within seconds, and it is what
+tore the head apart. Fix: shrink the square until it fits, then slide its centre
+inward. Square at every position (T16).
+
+**The shrinking head was never a separate bug.** It is the drift's consequence:
+content slides off the canvas, `BORDER_REPLICATE` smears the edge inward, and
+the face is eaten. In AD1 below, stopping the drift takes the radius from
+0.43× back to 0.98× with no scale control anywhere in the code.
+
+### AD1 — the anchor
+
+The two fixes stop the *pipeline* injecting drift. They cannot touch the image
+model's own bias — at strength 0.74 SDXL-Turbo substantially redraws the frame
+each pass and nothing structural prevents it placing the subject a little
+further right every time. So `anchor_loop()` measures the global translation the
+image actually underwent and integrates it out, with a proportional correction
+on the accumulated offset.
+
+It uses `cv2.phaseCorrelate` — the very thing the manifold replaced for
+*motion* — for the one job it is genuinely right for: estimating a single global
+shift, in order to cancel it. Active in the loop only; with a webcam, global
+translation is real information.
+
+Injected creep of 1.2 px/frame, one pass per frame, 120 frames = 0.56 of the
+frame:
+
+| | drift | radius |
+|---|---|---|
+| anchor off | 0.570 | 0.428× |
+| anchor 0.50 | **0.013** | **0.980×** |
+
+**AD1 [V]** — 98 % of the injected drift removed.
+
+One detail worth keeping: the **Hanning window** on the correlation is
+load-bearing. Without it the frame edges dominate and the estimate under-reads,
+leaking ~0.07 of the frame back in per 120 passes even at full anchor strength.
+With it, 0.013.
+
+### Lockstep, and why the first probe was meaningless
+
+In the loop the image model sits *inside* the feedback path, so running it on
+its own thread makes frames-per-dream a function of machine speed. A probe at
+drive 0 duly reported `CYCLE ~4` while the loop was issuing one dream every
+3.9 frames — the classifier was detecting the **gate**, not the models. Two
+fixes, both kept:
+
+* **Lockstep** (default on): one diffusion pass per frame, synchronously. The
+  loop becomes one well-defined map, `z → enc(diffuse(render(z)))`, applied
+  once per step. Slower, and the only version whose regime means anything.
+  Turn it off for speed and the readout stops being trustworthy — the tooltip
+  says so.
+* The regime readout **flags itself** when a detected period matches the dream
+  cadence: `CYCLE ~4 (= dream cadence, not dynamics)`.
+
+Even after that the probe refused to reproduce run to run. The cause was mine
+and had nothing to do with the loop: `StubDream` keyed its palette off Python's
+`hash()`, which is **randomised per process** by `PYTHONHASHSEED`, so the test
+double was a different function on every invocation. Now `zlib.crc32`, and the
+probe is bit-identical across runs (T8b guards it).
+
+With lockstep and the stub, the bare loop at drive 0 settles to a **fixed
+point**. The prediction worth testing is that SDXL-Turbo will *not* — diffusion
+injects fresh high-frequency content on every pass, which is exactly what a
+fixed point cannot survive. That is unmeasured.
+
+## Loading a different avatar model
+
+**Load avatar model...** in the sidebar opens any `.pt` checkpoint from the
+TinyAvatar/SplatField line — a different identity, a different resolution, a
+different packet count. It swaps the MANIFOLD layer only; it has nothing to do
+with the diffusion prompt.
+
+Two things had to be true for this to be safe rather than a source of silent
+mixed state:
+
+* **Validate at load, not at the next webcam frame.** `Manifold.__init__` now
+  does one forward pass at construction (`render(zeros(128))`). A checkpoint
+  that is merely the wrong shape — mismatched packet count, a half-written
+  save — fails at the button press with a message box, not three frames later
+  inside a tensor op with no context.
+* **Every piece of state tied to the OLD model gets dropped on swap**, not just
+  the model pointer: the pursued latent, the previous packet state (its
+  displacement to a differently-scaled `z` is meaningless), the standing dream,
+  the gate's key and residual history, the prompt-changed flag, the flicker
+  buffer. Keeping any of these would quietly blend two models' scales into one
+  number. `FlowPipeline.load_manifold()` does this centrally so the reset can't
+  be forgotten at a second call site later.
+
+Regression tests: T12 (missing file raises `FileNotFoundError` cleanly, not a
+crash inside torch) and T13, two-sided (every stale field must actually have
+been set before the swap AND actually cleared after — not just "touched").
+`--uismoke` drives the real button through a monkeypatched file dialog, once
+for the happy path and once for a bad path, and checks the bad path warns
+without disturbing the running model.
+
 ## Sidebar layout (second live session)
 
 The Manifold group collapsed into overlapping unreadable stripes and its
@@ -279,6 +475,7 @@ python manifold_flow.py --selftest                     # 17 checks, no model
 python manifold_flow.py --uismoke --model model2.pt    #  8 checks, offscreen
 python manifold_flow.py --gates --model model2.pt      # MF1, MF4
 python manifold_flow.py --gates --model model2.pt --video me.mp4   # + MF2
+python manifold_flow.py --model model2.pt --loop       # 2-manifold loop, no camera
 python manifold_flow.py --model model2.pt --stub       # live, no diffusers
 python manifold_flow.py --model model2.pt              # live, SDXL-Turbo
 ```

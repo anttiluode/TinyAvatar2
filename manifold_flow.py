@@ -102,6 +102,7 @@ import os
 import sys
 import time
 import threading
+import zlib
 from collections import deque
 
 import numpy as np
@@ -148,8 +149,11 @@ class FaceFramer:
         self.f = 0
         self.found = False
         # mode: "auto" Haar, "off" whole frame, "manual" a box you place
-        self.mode = "manual"                       # default changed to manual
-        self.manual = [0.57, 0.45, 0.35]           # cx, cy, half-side, all fractions
+        # defaults below are the ones he arrived at in a live session
+        # "off" is the working default for the loop: with no camera there is
+        # no face to hunt for, and the whole canvas IS the subject.
+        self.mode = "off"
+        self.manual = [0.57, 0.45, 0.35]    # cx, cy, half-side, all fractions
 
     def crop(self, fr):
         """-> (crop_bgr, (x0, y0, side)) in full-frame pixel coords."""
@@ -162,15 +166,9 @@ class FaceFramer:
             return fr[y0:y0 + s, x0:x0 + s], (x0, y0, s)
         if self.mode == "manual":
             cx, cy, hf = self.manual
-            half = max(hf * min(H, W), 8)
-            cx, cy = cx * W, cy * H
-            x0 = int(np.clip(cx - half, 0, W - 2))
-            y0 = int(np.clip(cy - half, 0, H - 2))
-            x1 = int(np.clip(cx + half, x0 + 2, W))
-            y1 = int(np.clip(cy + half, y0 + 2, H))
             self.found = True
             self.f += 1
-            return fr[y0:y1, x0:x1], (x0, y0, max(x1 - x0, y1 - y0))
+            return self._square(fr, cx * W, cy * H, hf * min(H, W))
         if self.det is not None and self.f % self.every == 0:
             g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
             det = self.det.detectMultiScale(g, 1.15, 5, minSize=(80, 80))
@@ -193,15 +191,34 @@ class FaceFramer:
             x0, y0 = (W - s) // 2, (H - s) // 2
             return fr[y0:y0 + s, x0:x0 + s], (x0, y0, s)
         cx, cy, half = self.box
-        s = int(half)
-        x0, x1 = int(max(cx - s, 0)), int(min(cx + s, W))
-        y0, y1 = int(max(cy - s, 0)), int(min(cy + s, H))
-        c = fr[y0:y1, x0:x1]
-        if c.size == 0:
-            s = min(H, W)
-            x0, y0 = (W - s) // 2, (H - s) // 2
-            return fr[y0:y0 + s, x0:x0 + s], (x0, y0, s)
-        return c, (x0, y0, max(x1 - x0, y1 - y0))
+        return self._square(fr, cx, cy, half)
+
+    @staticmethod
+    def _square(fr, cx, cy, half):
+        """A crop that is ALWAYS square.
+
+        The old code clipped the box against the frame edge and returned
+        whatever rectangle survived, which `cv2.resize` then squashed to the
+        encoder's square input. Measured: a box centred at 0.90 of the width
+        came back with aspect 0.690, and at 0.92 of the height, 1.623. The
+        encoder then saw a face stretched by up to 1.6x, so the render was
+        stretched, so the structure paste stretched the image further -- a
+        positive feedback that only fires when the face reaches a frame edge.
+        With a webcam it almost never does. In the closed loop it does within
+        seconds, and it is what tore the head apart.
+
+        Fix: shrink the square until it fits, then slide its centre inward.
+        The crop stays square at every position, so nothing is ever squashed.
+        """
+        H, W = fr.shape[:2]
+        half = float(np.clip(half, 8, min(H, W) / 2.0))
+        cx = float(np.clip(cx, half, W - half))
+        cy = float(np.clip(cy, half, H - half))
+        x0, y0 = int(round(cx - half)), int(round(cy - half))
+        side = int(round(2 * half))
+        x0 = max(0, min(x0, W - side))
+        y0 = max(0, min(y0, H - side))
+        return fr[y0:y0 + side, x0:x0 + side], (x0, y0, side)
 
 
 def normalize_crop(x, tgt_mean=0.52, tgt_std=0.26):
@@ -227,6 +244,8 @@ class Manifold:
         if ST is None:
             sys.exit("manifold_flow.py needs splat_trainer5.py and "
                      "splat_trainer3v2.py in the same directory.")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
         self.model, self.ck = ST.load_splatvae(path, chunk=chunk,
                                                map_location="cpu")
         self.model.to(device).eval()
@@ -234,6 +253,12 @@ class Manifold:
         self.S = self.model.ren.H
         self.N = self.model.ren.N
         self.path = path
+        # a cheap forward pass here, at load time, turns a checkpoint that is
+        # merely the wrong SHAPE (mismatched packet/image-size in the file's
+        # own header, a half-written save) into a clear failure at the button
+        # press instead of a cryptic one on the next webcam frame.
+        with torch.no_grad():
+            self.render(torch.zeros(128, device=device))
 
     def describe(self):
         return (f"{os.path.basename(self.path)}  {self.S}px  {self.N} packets  "
@@ -405,6 +430,22 @@ def manifold_coverage(state, out_hw, sigma_floor=0.02):
     return (c / m) if m > 1e-9 else c
 
 
+def coverage_geometry(cov):
+    """Centroid and RMS radius of a coverage map, in unit coords of its own
+    canvas. This is where the manifold thinks the thing IS and how big it
+    thinks it is -- the two quantities the structure paste must stop asserting
+    implicitly."""
+    H, W = cov.shape
+    gy, gx = np.meshgrid(np.linspace(0, 1, H, dtype=np.float32),
+                         np.linspace(0, 1, W, dtype=np.float32), indexing="ij")
+    w = np.maximum(cov, 0.0).astype(np.float32)
+    s = float(w.sum()) + 1e-9
+    cx, cy = float((w * gx).sum() / s), float((w * gy).sum() / s)
+    r = math.sqrt(max(float((w * ((gx - cx) ** 2 + (gy - cy) ** 2)).sum() / s),
+                      1e-12))
+    return cx, cy, r
+
+
 def spectral_split(added, n_oct=5):
     """Where in frequency did the diffusion put what it added?
 
@@ -464,6 +505,81 @@ def _ellipse_mask(canvas, box, frame_hw, expand=1.0, feather=61):
     return cv2.GaussianBlur(m, (k, k), 0)
 
 
+# ======================================================== the 2-manifold loop
+class LoopRegime:
+    """Classify what the coupled system is doing.
+
+    With the webcam removed, this is a closed dynamical system: two generative
+    models each taking the other's output as input. Such a thing has exactly
+    three interesting behaviours and it is worth naming which one is on screen
+    rather than watching and guessing.
+
+        FIXED POINT   the step size collapses -- the two models have agreed on
+                      an image that survives a round trip
+        CYCLE ~N      z returns near where it was N frames ago, repeatedly
+        WANDER        it keeps moving and does not come back
+
+    A frozen picture here is a RESULT, not a bug: it means the composition
+    enc(diffuse(render(z))) has a stable fixed point, which is a real property
+    of the pair and not something anyone put there.
+    """
+
+    def __init__(self, n=120):
+        self.z = deque(maxlen=n)
+        self.steps = deque(maxlen=n)
+
+    def observe(self, z):
+        z = np.asarray(z, np.float64).ravel()
+        if self.z:
+            self.steps.append(float(np.linalg.norm(z - self.z[-1])))
+        self.z.append(z.copy())
+
+    def report(self):
+        if len(self.z) < 12:
+            return dict(regime="warming up", step=0.0, period=0, ratio=0.0)
+        Z = np.stack(self.z)
+        scale = float(np.linalg.norm(Z, axis=1).mean()) + 1e-9
+        step = float(np.mean(self.steps)) if self.steps else 0.0
+        if step / scale < 0.01:
+            return dict(regime="FIXED POINT", step=step, period=0, ratio=0.0)
+        # net displacement over path length: an orbit returns, a walk does not
+        path = float(np.sum(self.steps)) + 1e-12
+        net = float(np.linalg.norm(Z[-1] - Z[0]))
+        ratio = net / path
+        # recurrence: is there a lag at which the trajectory revisits itself
+        # more closely than it does at a typical lag?
+        best_lag, best = 0, 1e9
+        base = np.median([np.linalg.norm(Z[i] - Z[j])
+                          for i in range(0, len(Z), 3)
+                          for j in range(0, len(Z), 3) if i != j]) + 1e-12
+        for lag in range(4, len(Z) // 2):
+            d = np.linalg.norm(Z[lag:] - Z[:-lag], axis=1).mean()
+            if d < best:
+                best, best_lag = d, lag
+        if best < 0.35 * base and ratio < 0.35:
+            return dict(regime=f"CYCLE ~{best_lag}", step=step,
+                        period=best_lag, ratio=ratio)
+        return dict(regime="WANDER", step=step, period=0, ratio=ratio)
+
+
+def loop_drive(t, dims, amp, seed=0):
+    """A slow, smooth, DETERMINISTIC latent perturbation for the loop.
+
+    Deliberately not white noise: noise would inject broadband energy every
+    frame and whatever motion appeared could always be blamed on the noise.
+    A few incommensurate sinusoids are reproducible and obviously not the
+    source of any structure, so what survives is the coupling.
+    """
+    if amp <= 0:
+        return np.zeros(dims, np.float32)
+    rs = np.random.RandomState(seed)
+    f = 0.003 + 0.02 * rs.rand(6)
+    ph = 2 * math.pi * rs.rand(6)
+    mix = rs.randn(6, dims).astype(np.float32) / math.sqrt(dims)
+    w = np.sin(2 * math.pi * f * t + ph).astype(np.float32)
+    return amp * (w @ mix)
+
+
 # ======================================================== the gate
 class ManifoldGate:
     """When to spend a diffusion step.
@@ -484,7 +600,7 @@ class ManifoldGate:
     tells the pipeline to lean on the webcam.
     """
 
-    def __init__(self, novelty=0.15, drift=28.0, max_reuse=45, res_k=2.5):
+    def __init__(self, novelty=0.30, drift=51.0, max_reuse=9, res_k=2.5):
         self.novelty_t, self.drift_t = novelty, drift
         self.max_reuse, self.res_k = max_reuse, res_k
         self.z_key = None
@@ -556,7 +672,11 @@ class StubDream:
         self.ready = True
 
     def __call__(self, img_rgb, prompt, strength):
-        h = abs(hash(prompt)) % 997
+        # zlib.crc32, not hash(): Python randomises string hashing per process
+        # (PYTHONHASHSEED), so hash() made this stub a DIFFERENT function on
+        # every run. Caught by the loop probe, whose trajectory refused to
+        # reproduce across invocations while every other input was seeded.
+        h = zlib.crc32(prompt.encode("utf-8")) % 997
         rng = np.random.RandomState(h)
         pal = rng.randint(40, 230, (3, 3)).astype(np.float32)
         g = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.
@@ -564,7 +684,13 @@ class StubDream:
         e = np.clip(np.abs(e) * 6.0, 0, 1)
         q = np.clip((g * 3).astype(np.int32), 0, 2)
         out = pal[q] * (1.0 - 0.6 * e[..., None])
-        out = out * (1 - strength) + img_rgb.astype(np.float32) * strength
+        # strength follows the diffusers img2img convention: 1.0 = reassert the
+        # model fully, 0.0 = leave the input alone. This was INVERTED here and
+        # nobody noticed until strength=1.00 became the default, at which point
+        # the stub silently became the identity function and quietly nulled
+        # three gates (MF4, LP1, LK1) that depend on the image step doing
+        # something. A test double with the wrong sign is worse than none.
+        out = out * strength + img_rgb.astype(np.float32) * (1.0 - strength)
         return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -683,12 +809,14 @@ class FlowPipeline:
         self.framer = FaceFramer()
         self.gate = ManifoldGate()
         self.cfg = dict(
-            strength=0.33, gravity=0.00, sharpness=0.00, pursuit=0.92,
-            structure=0.14, mask=True, mask_scale=1.17, use_field=True,
-            normalize=True, field_gain=1.00, prompt="",
+            strength=1.00, gravity=0.00, sharpness=0.00, pursuit=0.92,
+            structure=0.33, mask=True, mask_scale=1.00, use_field=True,
+            normalize=True, field_gain=1.04, prompt="",
             field_res=48, render_every=2,
-            mask_source="manifold",     # changed default to "manifold"
+            mask_source="manifold",   # "box" (Haar ellipse) or "manifold"
             measure_every=6,
+            loop=False, loop_drive=0.59, lockstep=True, render_fill=0.62,
+            loop_anchor=0.50,
         )
         if cfg:
             self.cfg.update(cfg)
@@ -703,9 +831,144 @@ class FlowPipeline:
         self.frames = 0
         self._rend = None
         self._hf = 0.0
+        self.regime = LoopRegime()
+        self.loop_t = 0
+        self._anchor_prev = None
+        self._anchor_acc = np.zeros(2, np.float64)
+        self._anchor_win = None
 
     # -- latent smoothing ---------------------------------------------------
+    # -- 2-manifold loop ----------------------------------------------------
+    def seed_loop(self, scale=1.5, seed=None):
+        """Start the loop from a point ON the avatar manifold rather than from
+        noise, so the first thing the diffusion sees is a face this model can
+        actually represent. Returns the seed frame in BGR."""
+        g = torch.Generator().manual_seed(
+            int(time.time() * 1000) % 2 ** 31 if seed is None else seed)
+        z = (torch.randn(128, generator=g) * scale).to(self.mf.dev)
+        r = (np.clip(self.mf.render(z), 0, 1) * 255).astype(np.uint8)
+        img = cv2.resize(r, (self.canvas, self.canvas))
+        self.z = None
+        self.prev = None
+        self.dream = img.copy()
+        self.regime = LoopRegime()
+        self.loop_t = 0
+        self._anchor_prev = None
+        self._anchor_acc = np.zeros(2, np.float64)
+        self._anchor_win = None
+        self.gate.z_key = None
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    def anchor_loop(self):
+        """Hold the closed loop's picture still.
+
+        The two structural fixes above stop the pipeline from injecting drift,
+        and with diffusion replaced by identity the loop now settles instead of
+        marching. But the image model has compositional biases of its own -- at
+        strength 0.74 SDXL-Turbo substantially redraws the frame each pass, and
+        nothing in the pipeline can prevent it from placing the subject a
+        little further right every time.
+
+        So measure the global translation the image actually underwent and
+        integrate it out. This is `cv2.phaseCorrelate`, the very thing the
+        manifold replaced for MOTION -- used here for the one job it is
+        genuinely right for: estimating a single global shift, in order to
+        cancel it. A proportional correction on the accumulated offset, so it
+        holds position without fighting local deformation.
+
+        Only active in the loop. With a webcam, global translation is real
+        information and must not be removed.
+        """
+        a = float(self.cfg["loop_anchor"])
+        if self.dream is None or a <= 0:
+            self._anchor_prev = None if self.dream is None else \
+                cv2.cvtColor(self.dream, cv2.COLOR_RGB2GRAY).astype(np.float32)
+            return
+        cur = cv2.cvtColor(self.dream, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        if self._anchor_prev is not None and \
+                self._anchor_prev.shape == cur.shape:
+            if self._anchor_win is None or \
+                    self._anchor_win.shape != cur.shape:
+                self._anchor_win = cv2.createHanningWindow(
+                    (cur.shape[1], cur.shape[0]), cv2.CV_32F)
+            try:
+                # the Hanning window matters: without it the frame edges
+                # dominate the correlation and the estimate under-reads, which
+                # leaks drift back in at roughly 0.07 of the frame per 120
+                # passes even with the anchor at full strength.
+                (dx, dy), _ = cv2.phaseCorrelate(self._anchor_prev, cur,
+                                                 self._anchor_win)
+            except cv2.error:
+                dx = dy = 0.0
+            if math.isfinite(dx) and math.isfinite(dy):
+                lim = 0.15 * self.canvas
+                self._anchor_acc += np.clip([dx, dy], -lim, lim)
+            corr = a * self._anchor_acc
+            if float(np.abs(corr).max()) > 0.05:
+                f = np.zeros((self.canvas, self.canvas, 2), np.float32)
+                f[..., 0] = -corr[0]
+                f[..., 1] = -corr[1]
+                self.dream = warp_image(self.dream, f)
+                self._anchor_acc -= corr
+                cur = cv2.cvtColor(self.dream,
+                                   cv2.COLOR_RGB2GRAY).astype(np.float32)
+        self._anchor_prev = cur
+
+    def loop_frame(self):
+        """The 'camera' in loop mode: the diffusion's own last output.
+
+        This is the entire closure. The avatar manifold reads the diffusion's
+        image; the diffusion reads the avatar's render and motion field. No
+        external input anywhere -- so anything that moves is the pair.
+        """
+        if self.dream is None:
+            return self.seed_loop()
+        return cv2.cvtColor(self.dream, cv2.COLOR_RGB2BGR)
+
+    def _regime_report(self):
+        """The regime, with one confound called out where it applies.
+
+        A probe run at drive 0 came back 'CYCLE ~4' -- and the loop was also
+        issuing one dream every 3.9 frames. A period that matches the dream
+        cadence is the GATE being detected, not the two models orbiting each
+        other. Flag it rather than let a re-dream rhythm be read as dynamics.
+        """
+        r = dict(self.regime.report())
+        if r["period"] and self.eng is not None and self.eng.count > 4:
+            cadence = self.frames / max(self.eng.count, 1)
+            if abs(r["period"] - cadence) <= max(1.0, 0.25 * cadence):
+                r["regime"] += " (= dream cadence, not dynamics)"
+        return r
+
+    def load_manifold(self, mf):
+        """Swap in a new checkpoint without losing the sliders. A different
+        model has a different S/N and almost certainly a different latent
+        scale, so the standing dream, the pursued latent, the gate's key and
+        its residual history are all stale for the new manifold and must be
+        dropped -- keeping any of them would silently mix two models' state."""
+        self.mf = mf
+        self.z = None
+        self.prev = None
+        self.dream = None
+        self._rend = None
+        self._hf = 0.0
+        self.regime = LoopRegime()
+        self.loop_t = 0
+        self._anchor_prev = None
+        self._anchor_acc = np.zeros(2, np.float64)
+        self._anchor_win = None
+        self.gate = ManifoldGate(self.gate.novelty_t, self.gate.drift_t,
+                                 self.gate.max_reuse, self.gate.res_k)
+        self._prompt_seen = None
+        self.flicker.clear()
+
     def _pursue(self, z_raw):
+        if self.cfg["loop"]:
+            self.loop_t += 1
+            amp = float(self.cfg["loop_drive"])
+            if amp > 0:
+                d = loop_drive(self.loop_t, int(z_raw.shape[0]), amp)
+                z_raw = z_raw + torch.from_numpy(d).to(z_raw.device)
         if self.z is None:
             return z_raw
         a = float(self.cfg["pursuit"])
@@ -773,11 +1036,34 @@ class FlowPipeline:
         z_np = self.z.cpu().numpy() if hasattr(self.z, "cpu") else \
             np.asarray(self.z)
         self.gate.observe(z_np, flow, residual)
+        if self.cfg["loop"]:
+            self.regime.observe(z_np)
         prompt_changed = (self.cfg["prompt"] != self._prompt_seen)
         if self.gate.should_fire(z_np, prompt_changed):
-            structure = self._structure(frame_bgr, rend, box, (H, W))
-            if self.eng.request(structure, self.cfg["prompt"],
-                                self.cfg["strength"], z_np):
+            structure = self._structure(frame_bgr, rend, box, (H, W), st)
+            if self.cfg["loop"] and self.cfg["lockstep"]:
+                # LOCKSTEP. In the loop the image model is INSIDE the feedback
+                # path, so running it on its own thread makes the number of
+                # transport frames per dream depend on machine speed -- and a
+                # probe run showed the detected regime swinging between FIXED
+                # POINT and CYCLE purely on thread scheduling. That is a
+                # timing artefact being read as dynamics. Run it synchronously
+                # and the loop becomes one well-defined map, z -> enc(diffuse(
+                # render(z))), applied once per frame. Slower, and the only
+                # version whose regime means anything.
+                t0 = time.time()
+                try:
+                    self.dream = self.eng.backend(
+                        structure, self.cfg["prompt"], self.cfg["strength"])
+                except Exception as e:
+                    print("dream error:", e)
+                self.eng.ms = (time.time() - t0) * 1000
+                self.eng.count += 1
+                self._prompt_seen = self.cfg["prompt"]
+                self.gate.armed(z_np)
+                self.fired += 1
+            elif self.eng.request(structure, self.cfg["prompt"],
+                                  self.cfg["strength"], z_np):
                 self._prompt_seen = self.cfg["prompt"]
                 self.gate.armed(z_np)
                 self.fired += 1
@@ -786,6 +1072,9 @@ class FlowPipeline:
         got = self.eng.take()
         if got is not None:
             self.dream = got[0]
+
+        if self.cfg["loop"]:
+            self.anchor_loop()
 
         out = self._composite(frame_bgr, box, (H, W), st)
 
@@ -810,10 +1099,11 @@ class FlowPipeline:
             flicker=float(np.mean(self.flicker)) if self.flicker else 0.0,
             face=self.framer.found, dreams=self.eng.count,
             zn=float(np.linalg.norm(z_np)), hf=self._hf,
+            **self._regime_report(),
         )
         return dict(out=out, render=rend, flow=flow, crop=crop_img)
 
-    def _structure(self, frame_bgr, rend, box, frame_hw):
+    def _structure(self, frame_bgr, rend, box, frame_hw, st):
         """What the diffusion is shown. Three things blended:
         the webcam (sharp, hallucination-prone), the standing dream (temporal
         memory -- StableAIflow's gravity), and the manifold render (closed,
@@ -824,25 +1114,60 @@ class FlowPipeline:
                            cv2.COLOR_BGR2RGB).astype(np.float32)
         s = float(self.cfg["structure"])
         if s > 0:
-            r8 = (np.clip(rend, 0, 1) * 255).astype(np.uint8)
-            x0, y0, side = box
-            H, W = frame_hw
-            sx, sy = self.canvas / float(W), self.canvas / float(H)
-            bw = max(int(side * sx), 2)
-            bh = max(int(side * sy), 2)
-            r8 = cv2.resize(r8, (bw, bh))
-            lay = web.copy()
-            ox, oy = int(x0 * sx), int(y0 * sy)
-            x1, y1 = min(ox + bw, self.canvas), min(oy + bh, self.canvas)
-            if x1 > ox and y1 > oy:
-                lay[oy:y1, ox:x1] = r8[:y1 - oy, :x1 - ox]
-            web = web * (1 - s) + lay * s
+            web = web * (1 - s) + self._paste_render(web, rend, st,
+                                                     box, frame_hw) * s
         if self.dream is not None:
             g = float(self.cfg["gravity"])
             if self.gate.off_manifold:
                 g *= 0.25          # sensor wins when the manifold is confused
             web = web * (1 - g) + self.dream.astype(np.float32) * g
         return np.clip(web, 0, 255).astype(np.uint8)
+
+    def _paste_render(self, web, rend, st, box, frame_hw):
+        """Blend the manifold render in WITHOUT letting it also assert a
+        position and a size.
+
+        The old paste dropped the render into the box rectangle. That looks
+        harmless and is fatal in a closed loop: the render's face sits wherever
+        the decoder puts it and fills whatever fraction of the canvas the
+        decoder chooses, so every pass nudged the image toward the manifold's
+        geometry and the nudge INTEGRATED. Measured with diffusion replaced by
+        identity, 50 passes, structure 0.14: centroid +0.017 of the frame
+        downward and radius 1.23x. It scaled cleanly with structure --
+        0.00/0.07/0.14/0.40 gave drift 0.0000/0.0031/0.0171/0.0284 and radius
+        1.000/1.106/1.228/1.759 -- so the render blend was the whole of it.
+        The motion field was innocent: turning it off entirely (field_gain 0)
+        changed nothing.
+
+        Fix: measure the render's own coverage centroid and radius, then place
+        it so the centroid lands on the BOX CENTRE and the radius is a fixed
+        fraction of the box. The paste geometry then depends only on the box
+        and one constant, so with a fixed box nothing integrates.
+        """
+        x0, y0, side = box
+        H, W = frame_hw
+        sx, sy = self.canvas / float(W), self.canvas / float(H)
+        cov = manifold_coverage(st, (48, 48))
+        ux, uy, ur = coverage_geometry(cov)
+        bw_px = max(side * sx, 4.0)
+        want_r = float(self.cfg["render_fill"]) * bw_px / 2.0
+        k = want_r / max(ur * bw_px, 1e-6)          # scale correction
+        pw = max(int(round(bw_px * k)), 4)
+        ph = max(int(round(side * sy * k)), 4)
+        r8 = cv2.resize((np.clip(rend, 0, 1) * 255).astype(np.uint8), (pw, ph))
+        tcx = (x0 + side / 2.0) * sx
+        tcy = (y0 + side / 2.0) * sy
+        ox = int(round(tcx - ux * pw))
+        oy = int(round(tcy - uy * ph))
+        lay = web.copy()
+        dx0, dy0 = max(ox, 0), max(oy, 0)
+        sx0, sy0 = max(-ox, 0), max(-oy, 0)
+        dx1 = min(ox + pw, self.canvas)
+        dy1 = min(oy + ph, self.canvas)
+        if dx1 > dx0 and dy1 > dy0:
+            lay[dy0:dy1, dx0:dx1] = r8[sy0:sy0 + (dy1 - dy0),
+                                       sx0:sx0 + (dx1 - dx0)]
+        return lay
 
     def _composite(self, frame_bgr, box, frame_hw, st):
         web = cv2.cvtColor(cv2.resize(frame_bgr, (self.canvas, self.canvas)),
@@ -1010,6 +1335,155 @@ def selftest():
     ok.append(_chk("T11b NEGATIVE: planted low frequency reads low",
                    spectral_split(lo) < 0.1, f"{spectral_split(lo):.3f}"))
 
+    # T12 -- Manifold() rejects a missing file cleanly, no crash
+    try:
+        Manifold("/tmp/does_not_exist_xyz.pt", "cpu")
+        got_err = False
+    except FileNotFoundError:
+        got_err = True
+    except Exception:
+        got_err = "wrong-type"
+    ok.append(_chk("T12 missing checkpoint raises FileNotFoundError, "
+                   "not a crash deep in torch", got_err is True,
+                   f"got {got_err!r}"))
+
+    # T13 -- load_manifold drops all state tied to the OLD model (two-sided:
+    # every one of these fields must actually change, not just be touched)
+    class _FakeMF:
+        def __init__(self, S=32, N=4):
+            self.S, self.N = S, N
+        def state(self, z):
+            return PacketState(np.zeros(self.N), np.zeros(self.N),
+                               np.full(self.N, 0.05), np.ones(self.N), z)
+        def render(self, z):
+            return np.zeros((self.S, self.S, 3), np.float32)
+        def encode(self, crop, normalize=True):
+            return np.zeros(8, np.float32), np.zeros((self.S, self.S, 3), np.float32)
+    pf = FlowPipeline.__new__(FlowPipeline)
+    pf.mf = _FakeMF(); pf.eng = None; pf.canvas = 64
+    pf.framer = FaceFramer(); pf.gate = ManifoldGate(0.3, 99, 99)
+    pf.cfg = dict(pursuit=1.0); pf.z = np.ones(8, np.float32)
+    pf.prev = pf.gate.armed(pf.z) or PacketState(np.zeros(4), np.zeros(4),
+                                                 np.ones(4) * .05, np.ones(4), None)
+    pf.gate.z_key = np.ones(8, np.float32)
+    pf.dream = np.ones((64, 64, 3), np.uint8)
+    pf._rend = np.ones((32, 32, 3)); pf._hf = 0.77
+    pf._prompt_seen = "a jellyfish"; pf.flicker = deque([1.0, 2.0], maxlen=120)
+    stale = (pf.z is not None, pf.prev is not None, pf.dream is not None,
+            pf.gate.z_key is not None, pf._prompt_seen is not None,
+            len(pf.flicker) > 0)
+    pf.load_manifold(_FakeMF(S=16, N=2))
+    fresh = (pf.z is None, pf.prev is None, pf.dream is None,
+            pf.gate.z_key is None, pf._prompt_seen is None,
+            len(pf.flicker) == 0)
+    ok.append(_chk("T13 load_manifold clears every piece of old-model state",
+                   all(stale) and all(fresh),
+                   f"was-set {stale} now-clear {fresh}"))
+    ok.append(_chk("T13b NEGATIVE: the new manifold object is actually wired in",
+                   pf.mf.S == 16 and pf.mf.N == 2))
+
+    # T14 -- LoopRegime must tell the three regimes apart, planted
+    rgm = LoopRegime()
+    for i in range(60):
+        rgm.observe(np.ones(8) * 3.0 + 1e-6 * np.random.RandomState(i).randn(8))
+    ok.append(_chk("T14a a still trajectory reads FIXED POINT",
+                   rgm.report()["regime"] == "FIXED POINT",
+                   rgm.report()["regime"]))
+    rgm = LoopRegime()
+    P = 12
+    for i in range(90):
+        a = 2 * math.pi * i / P
+        rgm.observe(np.array([math.cos(a), math.sin(a)] + [0.0] * 6) * 3.0)
+    r = rgm.report()
+    ok.append(_chk("T14b a period-12 orbit reads CYCLE at ~12",
+                   r["regime"].startswith("CYCLE") and abs(r["period"] - P) <= 2,
+                   f"{r['regime']} ratio {r['ratio']:.2f}"))
+    rgm = LoopRegime()
+    rs6 = np.random.RandomState(2)
+    zw = np.zeros(8)
+    for i in range(90):
+        zw = zw + rs6.randn(8) * 0.5
+        rgm.observe(zw + 8.0)
+    r = rgm.report()
+    ok.append(_chk("T14c NEGATIVE: a random walk reads WANDER, not a cycle",
+                   r["regime"] == "WANDER", f"{r['regime']} ratio {r['ratio']:.2f}"))
+
+    # T15 -- the loop drive is deterministic, smooth, and off at amp 0
+    d0 = loop_drive(5, 16, 0.0)
+    ok.append(_chk("T15a drive is exactly zero at amplitude 0",
+                   float(np.abs(d0).max()) == 0.0))
+    a1 = loop_drive(5, 16, 0.5)
+    a2 = loop_drive(5, 16, 0.5)
+    a3 = loop_drive(6, 16, 0.5)
+    consec = float(np.linalg.norm(a3 - a1))
+    ok.append(_chk("T15b drive is reproducible and slow (small step per frame)",
+                   np.array_equal(a1, a2) and consec < 0.25 * np.linalg.norm(a1),
+                   f"step/|a| {consec/max(np.linalg.norm(a1),1e-9):.3f}"))
+
+    # T16 -- the crop is square EVERYWHERE, including against a frame edge
+    frm = FaceFramer(); frm.mode = "manual"
+    blank = np.zeros((480, 640, 3), np.uint8)
+    aspects = []
+    for cx, cy, hs in ((0.5, 0.5, 0.35), (0.90, 0.5, 0.35), (0.5, 0.92, 0.35),
+                       (0.95, 0.95, 0.35), (0.02, 0.02, 0.35), (0.5, 0.5, 0.95)):
+        frm.manual = [cx, cy, hs]
+        c, _ = frm.crop(blank)
+        aspects.append(c.shape[1] / max(c.shape[0], 1))
+    ok.append(_chk("T16a crop is square at every box position",
+                   all(abs(a - 1.0) < 0.02 for a in aspects),
+                   "was 0.690 at x=0.90 and 1.623 at y=0.92 before the fix; "
+                   f"now {[round(a,3) for a in aspects]}"))
+    frm.manual = [0.95, 0.95, 0.35]
+    c, bx = frm.crop(blank)
+    ok.append(_chk("T16b NEGATIVE: the box stays inside the frame",
+                   bx[0] >= 0 and bx[1] >= 0 and
+                   bx[0] + bx[2] <= 640 and bx[1] + bx[2] <= 480,
+                   f"box {bx}"))
+
+    # T17 -- coverage_geometry recovers a planted centroid and radius
+    cvm = np.zeros((64, 64), np.float32)
+    cv2.circle(cvm, (48, 16), 8, 1.0, -1)
+    gcx, gcy, grr = coverage_geometry(cvm)
+    ok.append(_chk("T17a coverage centroid lands on the planted blob",
+                   abs(gcx - 48 / 63) < 0.02 and abs(gcy - 16 / 63) < 0.02,
+                   f"({gcx:.3f},{gcy:.3f}) want ({48/63:.3f},{16/63:.3f})"))
+    cv2.circle(cvm, (48, 16), 16, 1.0, -1)
+    _, _, grr2 = coverage_geometry(cvm)
+    ok.append(_chk("T17b NEGATIVE: a bigger blob gives a bigger radius",
+                   grr2 > 1.6 * grr, f"{grr:.4f} -> {grr2:.4f}"))
+
+    # T18 -- anchor_loop cancels a planted constant shift (no model needed)
+    def _anchor_run(anchor, n=40, shift=1.5):
+        pl = FlowPipeline.__new__(FlowPipeline)
+        pl.canvas = 128
+        pl.cfg = dict(loop=True, loop_anchor=anchor)
+        pl._anchor_prev = None
+        pl._anchor_acc = np.zeros(2, np.float64)
+        pl._anchor_win = None
+        img = np.zeros((128, 128, 3), np.uint8)
+        cv2.circle(img, (64, 64), 18, (240, 240, 240), -1)
+        cv2.circle(img, (58, 58), 4, (20, 20, 200), -1)
+        pl.dream = img
+        for _ in range(n):
+            M = np.float32([[1, 0, shift], [0, 1, shift]])
+            pl.dream = cv2.warpAffine(pl.dream, M, (128, 128),
+                                      borderMode=cv2.BORDER_REPLICATE)
+            pl.anchor_loop()
+        g = cv2.cvtColor(pl.dream, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        m = (g > 120).astype(np.float32)
+        ssum = m.sum() + 1e-9
+        yy, xx = np.mgrid[0:128, 0:128]
+        return (m * xx).sum() / ssum, (m * yy).sum() / ssum
+    x_off, y_off = _anchor_run(0.0)
+    x_on, y_on = _anchor_run(1.0)
+    d_off = math.hypot(x_off - 64, y_off - 64)
+    d_on = math.hypot(x_on - 64, y_on - 64)
+    ok.append(_chk("T18a anchor cancels a planted drift",
+                   d_on < 0.2 * d_off,
+                   f"uncontrolled {d_off:.1f}px -> anchored {d_on:.1f}px"))
+    ok.append(_chk("T18b NEGATIVE: with the anchor off the drift is present",
+                   d_off > 15.0, f"{d_off:.1f}px"))
+
     # T8 -- stub backend determinism
     s = StubDream()
     img8 = (np.random.RandomState(1).rand(64, 64, 3) * 255).astype(np.uint8)
@@ -1017,6 +1491,16 @@ def selftest():
     b1 = s(img8, "a jellyfish", 0.5)
     ok.append(_chk("T8 stub is deterministic per prompt and differs across",
                    np.array_equal(a1, a2) and not np.array_equal(a1, b1)))
+    ok.append(_chk("T8c stub strength follows the diffusers sense "
+                   "(1.0 = full reassert, 0.0 = no-op)",
+                   np.array_equal(s(img8, "k", 0.0), img8) and
+                   not np.array_equal(s(img8, "k", 1.0), img8),
+                   "inverted here once; at strength 1.0 the stub became the "
+                   "identity and nulled MF4/LP1/LK1 without failing"))
+    ok.append(_chk("T8b stub uses a process-STABLE hash (crc32, not hash())",
+                   zlib.crc32(b"a knight") % 997 == 379,
+                   "hash() is randomised by PYTHONHASHSEED; a run-to-run "
+                   "different stub silently broke loop reproducibility"))
 
     print(f"\n  {sum(ok)}/{len(ok)} checks pass")
     return 0 if all(ok) else 1
@@ -1189,11 +1673,167 @@ def gates(args):
     print("     avoid. This is a MONITOR, not a controller -- nothing in the")
     print("     app acts on it yet.")
 
+    # ---------------------------------------------------------------- LP1
+    print("\nLP1  is the 2-manifold loop actually COUPLED?")
+    print("     the claim is that the image model drives the avatar model. The")
+    print("     null is that the avatar just relaxes to its own fixed point and")
+    print("     the picture on screen is one model talking to itself.")
+    print("     arms: full loop vs the SAME loop with the image step replaced")
+    print("     by a pass-through. Loop drive is 0 in BOTH -- nothing injected.")
+
+    class _Passthrough:
+        name = "identity"
+        def __init__(self):
+            self.ready = True
+        def __call__(self, img_rgb, prompt, strength):
+            return img_rgb
+
+    rows = {}
+    for arm, backend in (("full", StubDream()), ("passthrough", _Passthrough())):
+        eng = DreamEngine(backend, 256)
+        pl = FlowPipeline(mf, eng, 256)
+        # structure MUST be 0 in both arms. With the working default of 0.33
+        # the pass-through arm is not a null: the structure paste puts the
+        # avatar's own render into the image path independent of the image
+        # model, so the "control" becomes a coupled loop through a second
+        # channel and the contrast collapses (measured 2.0x instead of 23x).
+        # Closing that channel is what makes this a test of the image model.
+        pl.cfg.update(loop=True, loop_drive=0.0, prompt="a bronze mask",
+                      render_every=1, measure_every=10 ** 9, structure=0.0)
+        pl.framer.mode = "off"
+        pl.seed_loop(seed=args.seed)
+        for _ in range(args.frames // 4):
+            pl.step(pl.loop_frame())
+            time.sleep(0.004)
+        rep = pl.regime.report()
+        rows[arm] = rep
+        print(f"     {arm:12s} step {rep['step']:.4f}  regime {rep['regime']}")
+        eng.stop()
+    lp1 = rows["full"]["step"] >= 3.0 * max(rows["passthrough"]["step"], 1e-9)
+    print(f"     LP1 [{'V' if lp1 else 'K'}]  gate: full >= 3x passthrough "
+          f"({rows['full']['step']/max(rows['passthrough']['step'],1e-9):.1f}x)")
+    print("     CAVEAT: this runs the STUB image model, not SDXL-Turbo. It")
+    print("     establishes that the architecture is closed and that the image")
+    print("     step is what keeps the latent moving. The magnitude and the")
+    print("     regime under real diffusion are UNMEASURED here.")
+
+    # ---------------------------------------------------------------- AD1
+    print("\nAD1  does the loop hold still?")
+    print("     image model = identity plus a fixed 1.2px/frame down-right")
+    print("     creep, standing in for SDXL's own compositional bias, one pass")
+    print("     per frame for 120 frames = 144px = 0.56 of the frame injected.")
+
+    class _Creep:
+        name = "creep"
+        ready = True
+        def __call__(self, img, prompt, strength):
+            M = np.float32([[1, 0, 1.2], [0, 1, 1.2]])
+            return cv2.warpAffine(img, M, (img.shape[1], img.shape[0]),
+                                  borderMode=cv2.BORDER_REPLICATE)
+
+    def _run(anchor):
+        eng = DreamEngine(_Creep(), 256)
+        pl = FlowPipeline(mf, eng, 256)
+        pl.cfg.update(loop=True, loop_drive=0.0, lockstep=True, prompt="x",
+                      render_every=1, measure_every=10 ** 9, structure=0.0,
+                      sharpness=0.0, gravity=0.0, loop_anchor=anchor)
+        pl.framer.mode = "off"
+        pl.gate.max_reuse = 1
+        pl.gate.novelty_t = 0.0
+        yy, xx = np.mgrid[0:256, 0:256].astype(np.float32) / 255.0
+        g = 200 * np.exp(-(((xx - .5) / .28) ** 2 + ((yy - .5) / .34) ** 2))
+        pl.dream = np.clip(np.stack([g, g * .9, g * .85], -1), 0, 255) \
+            .astype(np.uint8)
+        def meas(im):
+            gg = cv2.cvtColor(im, cv2.COLOR_RGB2GRAY).astype(np.float32)
+            m = (gg > 90).astype(np.float32); ss = m.sum() + 1e-9
+            ys, xs = np.mgrid[0:256, 0:256]
+            return ((m * xs).sum() / ss / 256, (m * ys).sum() / ss / 256,
+                    math.sqrt(ss / math.pi) / 256)
+        c0 = meas(pl.dream)
+        for _ in range(120):
+            pl.step(pl.loop_frame())
+        c1 = meas(pl.dream)
+        eng.stop()
+        return (math.hypot(c1[0] - c0[0], c1[1] - c0[1]), c1[2] / c0[2])
+
+    d_off, r_off = _run(0.0)
+    d_on, r_on = _run(0.5)
+    print(f"     anchor off  drift {d_off:.4f} of frame   radius {r_off:.3f}x")
+    print(f"     anchor 0.50 drift {d_on:.4f} of frame   radius {r_on:.3f}x")
+    ad1 = d_on <= 0.2 * d_off and 0.95 <= r_on <= 1.05
+    print(f"     AD1 [{'V' if ad1 else 'K'}]  gate: anchored drift <= 20% of "
+          f"unanchored, radius within 5%")
+    print("     Note the radius column. The shrinking head is not a second")
+    print("     bug -- it is the drift's consequence: content slides off the")
+    print("     canvas, BORDER_REPLICATE smears the edge inward, and the face")
+    print("     is eaten. Stop the drift and the shrink stops with it.")
+
+    # ---------------------------------------------------------------- LK1
+    print("\nLK1  attractor cartography: how hard does the loop LOCK?")
+    print("     He observed the CelebA avatar and SDXL settling on one narrow")
+    print("     face -- a chiselled male 40-60. If that is real, the loop is a")
+    print("     contraction: an ensemble of different starting points should")
+    print("     collapse toward a common attractor. Measure it instead of")
+    print("     describing it. Arms: full loop vs the image step replaced by")
+    print("     a pass-through. Drive 0 in both.")
+
+    class _Pass2:
+        name = "identity"
+        ready = True
+        def __call__(self, img, prompt, strength):
+            return img
+
+    def _spread(V):
+        V = np.stack(V)
+        d = [np.linalg.norm(V[i] - V[j]) for i in range(len(V))
+             for j in range(i + 1, len(V))]
+        return float(np.mean(d)), float(np.linalg.norm(V - V.mean(0), axis=1).mean())
+
+    K = max(4, min(args.n, 8))
+    rows = {}
+    for arm, backend in (("full", StubDream()), ("passthrough", _Pass2())):
+        seeds, ends = [], []
+        for k in range(K):
+            eng = DreamEngine(backend, 256)
+            pl = FlowPipeline(mf, eng, 256)
+            pl.cfg.update(loop=True, loop_drive=0.0, lockstep=True,
+                          render_every=1, measure_every=10 ** 9,
+                          prompt="high res photo of a face, greenscreen")
+            pl.framer.mode = "off"
+            pl.seed_loop(seed=1000 + k)
+            z0 = None
+            for i in range(args.frames // 4):
+                pl.step(pl.loop_frame())
+                if i == 0:
+                    z0 = np.asarray(pl.z.cpu() if hasattr(pl.z, "cpu")
+                                    else pl.z, np.float64).copy()
+            seeds.append(z0)
+            ends.append(np.asarray(pl.z.cpu() if hasattr(pl.z, "cpu")
+                                   else pl.z, np.float64).copy())
+            eng.stop()
+        s_pair, _ = _spread(seeds)
+        e_pair, e_rad = _spread(ends)
+        rows[arm] = (s_pair, e_pair, e_rad)
+        print(f"     {arm:12s} start spread {s_pair:.3f} -> attractor spread "
+              f"{e_pair:.3f}   contraction {e_pair/max(s_pair,1e-9):.3f}")
+    cf = rows["full"][1] / max(rows["full"][0], 1e-9)
+    cp = rows["passthrough"][1] / max(rows["passthrough"][0], 1e-9)
+    lk1 = cf <= 0.5 * cp
+    print(f"     LK1 [{'V' if lk1 else 'K'}]  gate: full contraction <= 0.5x "
+          f"pass-through ({cf:.3f} vs {cp:.3f})")
+    print("     What the number means: contraction << 1 says the pair has a")
+    print("     narrow attractor and the starting point does not matter much.")
+    print("     That IS the lock, as a number rather than an impression. It is")
+    print(f"     n={K} and the STUB image model; the figure that matters is")
+    print("     this same run under SDXL-Turbo with his own prompt.")
+
     print("\nVERDICT")
     print(f"  MF1 {'[V]' if mf1 else '[K]'}   "
           f"MF2 {'[V]' if mf2 else ('[K]' if mf2 is False else 'UNMEASURED')}   "
           f"MF3 live-only   MF4 {'[V]' if mf4 else '[K]'}   "
-          f"DM1 {'[V]' if dm1 else '[K]'}")
+          f"DM1 {'[V]' if dm1 else '[K]'}   LP1 {'[V]' if lp1 else '[K]'}   "
+          f"AD1 {'[V]' if ad1 else '[K]'}   LK1 {'[V]' if lk1 else '[K]'}")
     return 0
 
 
@@ -1290,9 +1930,24 @@ def live(args):
                 QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             lay.addWidget(self.scroll, 0)
 
-            info = QtWidgets.QLabel(mf.describe())
-            info.setObjectName("cap"); _wrap(info)
-            side.addWidget(info)
+            self.mf_path = args.model
+            self.info = QtWidgets.QLabel(mf.describe())
+            self.info.setObjectName("cap"); _wrap(self.info)
+            side.addWidget(self.info)
+
+            mrow = QtWidgets.QHBoxLayout()
+            self.btn_load = QtWidgets.QPushButton("Load avatar model...")
+            self.btn_load.clicked.connect(self.load_model)
+            mrow.addWidget(self.btn_load)
+            wmr = QtWidgets.QWidget(); wmr.setLayout(mrow)
+            side.addWidget(wmr)
+            mhint = QtWidgets.QLabel(
+                "Any TinyAvatar / SplatField checkpoint (.pt) -- a different "
+                "identity or resolution for the MANIFOLD layer. This is not "
+                "the diffusion prompt; it changes what the render and the "
+                "motion field are made of.")
+            mhint.setObjectName("cap"); _wrap(mhint)
+            side.addWidget(mhint)
             if not pipe.framer.available:
                 warn = QtWidgets.QLabel(
                     "Haar cascade NOT FOUND -- auto framing cannot work on "
@@ -1359,19 +2014,19 @@ def live(args):
 
             gd = QtWidgets.QGroupBox("Diffusion")
             gdl = QtWidgets.QVBoxLayout(gd)
-            # Updated defaults to match image
-            slider(gdl, "strength", 0.10, 1.00, 0.33, "Dream strength")
+            slider(gdl, "strength", 0.10, 1.00, 1.00, "Dream strength")
             slider(gdl, "gravity", 0.00, 0.99, 0.00, "Feedback gravity")
             slider(gdl, "sharpness", 0.00, 2.00, 0.00, "Crystallizer")
-            slider(gdl, "structure", 0.00, 1.00, 0.14,
+            slider(gdl, "structure", 0.00, 1.00, 0.33,
                    "Manifold share of structure")
             side.addWidget(gd)
 
             gm = QtWidgets.QGroupBox("Manifold")
             gml = QtWidgets.QVBoxLayout(gm)
             slider(gml, "pursuit", 0.05, 1.00, 0.92, "Pursuit alpha")
-            slider(gml, "field_gain", 0.00, 2.00, 1.00, "Field gain")
-            slider(gml, "mask_scale", 0.60, 2.20, 1.17, "Mask scale")
+            slider(gml, "field_gain", 0.00, 2.00, 1.04, "Field gain")
+            slider(gml, "mask_scale", 0.60, 2.20, 1.00, "Mask scale")
+            slider(gml, "render_fill", 0.30, 1.10, 0.62, "Render fill of box")
             self.cbf = QtWidgets.QCheckBox("Dense manifold field  (off = "
                                            "single global shift)")
             self.cbf.setChecked(True)
@@ -1406,7 +2061,6 @@ def live(args):
             gml.addWidget(wmk)
 
             self.man = {}
-            # manual box sliders initialized with the new defaults
             for key, i, lab, val in (("mx", 0, "Manual box x", 0.57),
                                      ("my", 1, "Manual box y", 0.45),
                                      ("ms", 2, "Manual box size", 0.35)):
@@ -1434,6 +2088,37 @@ def live(args):
             gml.addWidget(self.cbn)
             side.addWidget(gm)
 
+            gloop = QtWidgets.QGroupBox("2 Manifold Loop (no webcam)")
+            gll = QtWidgets.QVBoxLayout(gloop)
+            self.btn_loop = QtWidgets.QPushButton("Enter 2-manifold loop")
+            self.btn_loop.clicked.connect(self.toggle_loop)
+            gll.addWidget(self.btn_loop)
+            self.btn_seed = QtWidgets.QPushButton("Reseed from the manifold")
+            self.btn_seed.clicked.connect(lambda: pipe.seed_loop())
+            gll.addWidget(self.btn_seed)
+            slider(gll, "loop_drive", 0.00, 1.00, 0.59, "Loop drive")
+            slider(gll, "loop_anchor", 0.00, 1.00, 0.50,
+                   "Anchor (stop the drift)")
+            self.cbl = QtWidgets.QCheckBox(
+                "Lockstep  (one diffusion pass per frame)")
+            self.cbl.setChecked(True)
+            self.cbl.stateChanged.connect(
+                lambda v: pipe.cfg.__setitem__("lockstep", bool(v)))
+            gll.addWidget(self.cbl)
+            lnote = QtWidgets.QLabel(
+                "The camera is removed and the two models feed each other: "
+                "the avatar encodes the diffusion's last image, the diffusion "
+                "paints over the avatar's render and motion field. Loop drive "
+                "0 means NOTHING is being injected -- whatever moves is the "
+                "pair. The status bar names the regime; a frozen picture is a "
+                "fixed point, which is a result, not a hang. Lockstep off is "
+                "faster and prettier, but then the frames-per-dream depends "
+                "on your machine and the regime readout stops meaning "
+                "anything.")
+            lnote.setObjectName("cap"); _wrap(lnote)
+            gll.addWidget(lnote)
+            side.addWidget(gloop)
+
             gg = QtWidgets.QGroupBox("Gate")
             ggl = QtWidgets.QVBoxLayout(gg)
 
@@ -1455,10 +2140,10 @@ def live(args):
                 v.addWidget(lab); v.addWidget(s)
                 ggl.addWidget(w)
 
-            gslider("novelty_t", 0.02, 0.60, 0.15, "Novelty threshold")
-            gslider("drift_t", 4.0, 120.0, 28.0, "Drift threshold (px)",
+            gslider("novelty_t", 0.02, 0.60, 0.30, "Novelty threshold")
+            gslider("drift_t", 4.0, 120.0, 51.0, "Drift threshold (px)",
                     "{:.0f}")
-            gslider("max_reuse", 3, 120, 45, "Max frames per dream", "{:.0f}")
+            gslider("max_reuse", 3, 120, 9, "Max frames per dream", "{:.0f}")
             side.addWidget(gg)
 
             # QGroupBox defaults to a Preferred vertical policy, which means
@@ -1474,6 +2159,7 @@ def live(args):
             grid = QtWidgets.QGridLayout()
             lay.addLayout(grid, 1)
             self.panels = {}
+            self.panels_cap = {}
             for i, (k, t) in enumerate([
                     ("out", "output  (identity from the prompt, motion from "
                             "the manifold)"),
@@ -1490,17 +2176,11 @@ def live(args):
                 box.addWidget(p, 1); box.addWidget(c)
                 grid.addLayout(box, i // 2, i % 2)
                 self.panels[k] = p
+                self.panels_cap[k] = c
 
-            # Set default framing to manual and mask source to manifold
-            self.cmb_fr.setCurrentIndex(2)          # manual
-            self.cmb_mk.setCurrentIndex(1)          # manifold
-            self.on_framer(2)                       # show manual sliders
-
-            if not pipe.framer.available:
-                # auto framing is impossible here; starting in it means a
-                # silent centre crop of the whole room, which is what the
-                # first live session actually ran.
-                self.cmb_fr.setCurrentIndex(2)
+            self.cmb_fr.setCurrentIndex(1)      # off (whole frame)
+            self.cmb_mk.setCurrentIndex(1)      # manifold coverage
+            self.on_framer(1)
             self.status = self.statusBar()
             self.timer = QtCore.QTimer(self)
             self.timer.timeout.connect(self.tick)
@@ -1534,6 +2214,40 @@ def live(args):
             super().resizeEvent(e)
             self._fix_wraps()
 
+        def load_model(self):
+            start = os.path.dirname(os.path.abspath(self.mf_path)) \
+                if self.mf_path else "."
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Load avatar model", start,
+                "Splat checkpoints (*.pt);;All files (*)")
+            if not path:
+                return
+            self.btn_load.setEnabled(False)
+            self.btn_load.setText("Loading...")
+            QtWidgets.QApplication.processEvents()
+            try:
+                newmf = Manifold(path, dev)
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(
+                    self, "Could not load model",
+                    f"{os.path.basename(path)}\n\n{e}\n\n"
+                    "The previous model is still active.")
+                self.btn_load.setEnabled(True)
+                self.btn_load.setText("Load avatar model...")
+                return
+            was_running = self.running
+            if was_running:
+                self.timer.stop()
+            pipe.load_manifold(newmf)
+            self.mf_path = path
+            self.info.setText(newmf.describe())
+            self._fix_wraps()
+            self.status.showMessage(f"loaded {os.path.basename(path)}")
+            self.btn_load.setEnabled(True)
+            self.btn_load.setText("Load avatar model...")
+            if was_running:
+                self.timer.start(15)
+
         def on_framer(self, i):
             pipe.framer.mode = ("auto", "off", "manual")[i]
             for w in self.man.values():
@@ -1550,13 +2264,31 @@ def live(args):
                 if not self.prompt.text().strip():
                     self.prompt.setText("sharp detailed photograph, in focus")
             else:
-                vals = dict(strength=0.50, gravity=0.70, sharpness=1.00,
-                            structure=0.00, pursuit=0.35, field_gain=1.00,
-                            mask_scale=1.20)
-                self.cmb_mk.setCurrentIndex(0)
+                vals = dict(strength=1.00, gravity=0.00, sharpness=0.00,
+                            structure=0.33, pursuit=0.92, field_gain=1.04,
+                            mask_scale=1.00)
+                self.cmb_mk.setCurrentIndex(1)
             for k, v in vals.items():
                 lo, hi = self.ranges[k]
                 self.sliders[k].setValue(int((v - lo) / (hi - lo) * 1000))
+
+        def toggle_loop(self):
+            on = not pipe.cfg["loop"]
+            pipe.cfg["loop"] = on
+            self.btn_loop.setText("Leave loop (back to webcam)" if on
+                                  else "Enter 2-manifold loop")
+            self.panels_cap["crop"].setText(
+                "encoder input  (the DIFFUSION's last image, cropped)" if on
+                else "encoder input  (face-framed crop)")
+            self.panels_cap["out"].setText(
+                "output  (closed loop: no camera anywhere in this picture)"
+                if on else
+                "output  (identity from the prompt, motion from the manifold)")
+            if on:
+                pipe.seed_loop()
+                if not self.running:
+                    self.toggle()          # loop needs no camera to start
+            self._fix_wraps()
 
         def toggle(self):
             if self.running:
@@ -1566,10 +2298,13 @@ def live(args):
                     self.cap.release(); self.cap = None
                 self.btn.setText("Start"); self.btn.setObjectName("")
             else:
-                self.cap = cv2.VideoCapture(args.camera)
-                if not self.cap.isOpened():
-                    self.status.showMessage("camera not available")
-                    return
+                if not pipe.cfg["loop"]:
+                    self.cap = cv2.VideoCapture(args.camera)
+                    if not self.cap.isOpened():
+                        self.status.showMessage(
+                            "camera not available -- the 2-manifold loop "
+                            "runs without one")
+                        return
                 self.running = True
                 self.timer.start(15)
                 self.btn.setText("Stop"); self.btn.setObjectName("stop")
@@ -1589,9 +2324,14 @@ def live(args):
                 QtCore.Qt.TransformationMode.SmoothTransformation))
 
         def tick(self):
-            ok_, fr = self.cap.read()
-            if not ok_:
-                return
+            if pipe.cfg["loop"]:
+                fr = pipe.loop_frame()
+            else:
+                if self.cap is None:
+                    return
+                ok_, fr = self.cap.read()
+                if not ok_:
+                    return
             pipe.cfg["prompt"] = self.prompt.text()
             r = pipe.step(fr)
             self.show_np("out", r["out"])
@@ -1613,7 +2353,10 @@ def live(args):
                 f"{'  OFF-MANIFOLD' if t['off'] else ''}  |  "
                 f"last fire: {t['reason']}  |  flicker {t['flicker']:.2f}  "
                 f"added HF {t['hf']*100:.0f}% (geom~2 detail~22)  "
-                f"|z| {t['zn']:.2f}  face {'yes' if t['face'] else 'NO'}")
+                f"|z| {t['zn']:.2f}  " +
+                (f"LOOP: {t['regime']}  step {t['step']:.3f}  "
+                 f"net/path {t['ratio']:.2f}" if pipe.cfg["loop"]
+                 else f"face {'yes' if t['face'] else 'NO'}"))
 
         def keyPressEvent(self, e):
             k = e.key()
@@ -1637,6 +2380,8 @@ def live(args):
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(QSS)
     w = Win(); w.show()
+    if getattr(args, "loop", False):
+        w.toggle_loop()
     return app.exec()
 
 
@@ -1733,6 +2478,9 @@ def uismoke(args):
             w.cbf.isChecked() != before)
         pipe = w.pipe
         # framing modes: off must produce a full-frame crop, manual a box
+        w.cmb_fr.setCurrentIndex(0); w.tick()
+        chk("framing 'auto' selects the Haar framer",
+            pipe.framer.mode == "auto")
         w.cmb_fr.setCurrentIndex(1); w.tick()
         chk("framing 'off' disables the framer",
             pipe.framer.mode == "off" and not pipe.framer.found)
@@ -1766,8 +2514,13 @@ def uismoke(args):
             f"structure {pipe.cfg['structure']:.2f} "
             f"strength {pipe.cfg['strength']:.2f}")
         w.preset("prompt")
-        chk("PROMPT preset puts structure back to 0",
-            pipe.cfg["structure"] < 0.02)
+        chk("PROMPT preset restores the tuned defaults",
+            abs(pipe.cfg["structure"] - 0.33) < 0.02 and
+            abs(pipe.cfg["strength"] - 1.00) < 0.02 and
+            abs(pipe.cfg["pursuit"] - 0.92) < 0.02,
+            f"structure {pipe.cfg['structure']:.2f} "
+            f"strength {pipe.cfg['strength']:.2f} "
+            f"pursuit {pipe.cfg['pursuit']:.2f}")
 
         for _ in range(8):
             w.tick()
@@ -1779,6 +2532,61 @@ def uismoke(args):
             QtWidgets.QApplication.processEvents()
             w.grab().save(shot)
             print(f"  wrote {shot}")
+        # Load avatar model: happy path swaps mf and resets pipeline state;
+        # a missing/bad file must warn and leave the running model untouched.
+        old_mf = pipe.mf
+        w.tick()  # give the pipeline some state worth clearing
+        _orig_dlg = QtWidgets.QFileDialog.getOpenFileName
+        QtWidgets.QFileDialog.getOpenFileName = staticmethod(
+            lambda *a, **k: (args.model, ""))
+        w.load_model()
+        chk("Load avatar model swaps in a new Manifold and resets state",
+            pipe.mf is not old_mf and pipe.z is None and pipe.dream is None,
+            f"swapped={pipe.mf is not old_mf} z={pipe.z} dream={pipe.dream}")
+
+        QtWidgets.QFileDialog.getOpenFileName = staticmethod(
+            lambda *a, **k: ("/tmp/does_not_exist_xyz.pt", ""))
+        _orig_warn = QtWidgets.QMessageBox.warning
+        warned = []
+        QtWidgets.QMessageBox.warning = staticmethod(
+            lambda *a, **k: warned.append(1))
+        mf_before = pipe.mf
+        w.load_model()
+        chk("a bad model path warns and keeps the previous model running",
+            len(warned) == 1 and pipe.mf is mf_before,
+            f"warned={warned} kept={pipe.mf is mf_before}")
+        QtWidgets.QFileDialog.getOpenFileName = _orig_dlg
+        QtWidgets.QMessageBox.warning = _orig_warn
+
+        # ---- 2-manifold loop: must run with NO camera at all
+        w.toggle_loop()
+        chk("entering the loop seeds a dream and flips the button",
+            pipe.cfg["loop"] and pipe.dream is not None
+            and "Leave" in w.btn_loop.text())
+        if w.cap is not None:
+            w.cap.release()
+        w.cap = None                      # prove the camera is not consulted
+        d0 = pipe.dream.copy()
+        for _ in range(30):
+            w.tick()
+        chk("the loop ticks with the camera object removed entirely",
+            pipe.dream is not None and w.panels["out"].pixmap() is not None)
+        chk("the loop actually moves (dream changes with no input)",
+            float(np.abs(pipe.dream.astype(np.float32)
+                         - d0.astype(np.float32)).mean()) > 0.5)
+        chk("panel captions say the camera is out of the picture",
+            "DIFFUSION" in w.panels_cap["crop"].text())
+        chk("status names the loop regime",
+            "LOOP:" in w.status.currentMessage(),
+            w.status.currentMessage()[-46:])
+        w.btn_seed.click()
+        chk("reseed restarts the loop from the manifold",
+            pipe.loop_t == 0 and pipe.z is None and pipe.dream is not None)
+        w.toggle_loop()
+        chk("leaving the loop restores the webcam captions",
+            not pipe.cfg["loop"] and "face-framed" in w.panels_cap["crop"].text())
+        w.cap = FakeCap()
+
         w.toggle()
         chk("stop releases camera and timer",
             not w.running and not w.timer.isActive())
@@ -1803,10 +2611,14 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--canvas", type=int, default=512)
+    ap.add_argument("--loop", action="store_true",
+                    help="start in the 2-manifold loop (needs no camera)")
     ap.add_argument("--stub", action="store_true",
                     help="placeholder backend, no diffusers, no download")
     ap.add_argument("--prompt",
-                    default="charcoal sketch of a cyborg, dark, gritty, detailed")
+                    default="high res photo of famous persons face, only one "
+                            "person, in focus at press event, greenscreen, "
+                            "face centered")
     ap.add_argument("--video", default=None, help="clip for MF2")
     ap.add_argument("--frames", type=int, default=200)
     ap.add_argument("--n", type=int, default=8)
