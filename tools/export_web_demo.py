@@ -17,11 +17,17 @@ import argparse
 import json
 import math
 import struct
+import sys
 import zlib
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+# A script launched as ``python tools/export_web_demo.py`` gets ``tools/`` as
+# sys.path[0].  Make the repository model module importable in clean runners,
+# independent of the caller's PYTHONPATH.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import splat_trainer5 as ST
 
