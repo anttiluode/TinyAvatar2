@@ -37,6 +37,39 @@ convolutions in the decoder — the face *is* the interference pattern.
 
 > Do not hype. Do not lie. Just show.
 
+## Pull a face in the browser
+
+**[THIS FACE HAS NO SKELETON. PULL IT.](https://anttiluode.github.io/TinyAvatar2/)**
+
+The zero-install version starts with four deterministic faces from the shipped
+checkpoint. Drag an eye, cheek, or mouth in **WHOLE FACE** mode and the page
+uses the trained decoder's position Jacobian to move through the local learned
+manifold. Switch to **ONLY THE GRAB** for the matched post-decoder control, or
+delete packets with the **HOW MUCH FACE?** slider until identity disappears.
+
+The display follows the later
+[`SplatWorld2`](https://github.com/anttiluode/Splatworld2) anti-fire rule:
+every result is decoded from immutable anchor-relative state. The previous
+displayed pixels are never recycled into the next frame, so progressive
+reconstruction blur cannot masquerade as a changing local mode. Each of the
+four faces also carries its own frozen local Jacobian rather than sharing one
+universal rig, reflecting the face-dependent-local-rig observation made there.
+
+The browser downloads a 6.9 MB ONNX model and runs it locally with WebAssembly;
+it uploads nothing and asks for no camera. This is deliberately a playable
+slice, not a claim that the browser port reproduces the full native solver:
+its Jacobian is frozen at each anchor face and it uses lighter damping to make
+up for the browser's lower inference cadence. The 4.4–9.7× coupling numbers
+shown on the page are the native registered gates below, not measurements made
+by the web toy.
+
+Rebuild the checked-in web assets from `model2.pt` with:
+
+```bash
+python tools/export_web_demo.py --checkpoint model2.pt --out web \
+  --seeds 1,7,8,12
+```
+
 ---
 
 ## Install
