@@ -1,0 +1,25 @@
+{
+  "format": "tinyavatar-web-controls-v1",
+  "checkpoint": "model2.pt",
+  "image_size": 96,
+  "num_packets": 256,
+  "latent_size": 128,
+  "grab_radius": 0.1,
+  "native_damping": 0.08,
+  "browser_damping": 0.005,
+  "display_rule": "immutable-anchor-relative-state",
+  "anchors": [
+    {
+      "seed": 1
+    },
+    {
+      "seed": 7
+    },
+    {
+      "seed": 8
+    },
+    {
+      "seed": 12
+    }
+  ]
+}
