@@ -46,9 +46,29 @@ def main() -> None:
 
     model = WEB / "tinyavatar.onnx"
     require(model.stat().st_size > 1_000_000, "ONNX model is missing or suspiciously small")
+
+    # Anti-fire invariants. The browser port intentionally has a frozen
+    # anchor Jacobian, so manifold dragging must be target-seeking and bounded.
+    # Regression here recreates the old pointer-event-rate latent integrator.
+    app = (WEB / "app.js").read_text(encoding="utf-8")
+    require("const LATENT_TRUST_RADIUS = 3.0;" in app, "missing latent trust region")
+    require(
+        "baseOffset: copyArray(state.latentOffset)" in app,
+        "drag does not freeze its starting latent offset",
+    )
+    require(
+        "latentTarget(state.drag.pin, state.drag.baseOffset, targetX, targetY)" in app,
+        "manifold drag is not target-seeking",
+    )
+    require(
+        "state.latentOffset[latent] += delta[latent]" not in app,
+        "open latent pointer integrator returned",
+    )
+
     print(
         f"web demo ok: {anchors} faces, {packets} packets, "
-        f"{len(local_refs)} local page assets, {model.stat().st_size / 1e6:.1f} MB model"
+        f"{len(local_refs)} local page assets, {model.stat().st_size / 1e6:.1f} MB model, "
+        "target-seeking bounded latent drag"
     )
 
 
