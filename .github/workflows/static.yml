@@ -1,4 +1,4 @@
-# Simple workflow for deploying static content to GitHub Pages
+# Simple workflow for deploying the TinyAvatar2 browser demo to GitHub Pages
 name: Deploy static content to Pages
 
 on:
@@ -36,8 +36,10 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # Upload entire repository
-          path: '.'
+          # Keep this aligned with the Browser demo workflow. Deploying the
+          # repository root races that workflow and can replace the live toy
+          # with a tree that has no root index.html.
+          path: 'web'
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
