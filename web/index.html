@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080b0a">
+  <meta name="description" content="Pull a face with no skeleton, then erase 90% of the interference waves that draw it.">
+  <title>No Skeleton — TinyAvatar Ragdoll</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <div class="noise" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <a class="mark" href="https://github.com/anttiluode/TinyAvatar2">TINYAVATAR 2</a>
+    <div class="live-readout"><span class="status-dot" id="statusDot"></span><span id="engineReadout">ASSEMBLING 256 WAVES…</span></div>
+    <div class="privacy">RUNS ON THIS DEVICE</div>
+  </header>
+
+  <main class="stage">
+    <section class="intro" aria-labelledby="title">
+      <p class="eyebrow">A LEARNED FACE RAGDOLL</p>
+      <h1 id="title">THIS FACE HAS<br>NO SKELETON.<br><em>PULL IT.</em></h1>
+      <p class="lede">It is drawn by 256 interference waves. Drag an eye, cheek, or mouth. Each face exposes a different local rig.</p>
+      <p class="hint"><span>TRY:</span> pull one eye sideways, then erase 90% of the waves.</p>
+    </section>
+
+    <section class="machine" aria-label="Interactive wave face">
+      <div class="canvas-wrap" id="canvasWrap">
+        <img class="poster" id="poster" src="poster.png" alt="A face synthesized from Gabor wave packets">
+        <canvas id="faceCanvas" width="800" height="800" tabindex="0" role="img" aria-label="Interactive face. Drag any point to deform it, or use the arrow keys to pull from the center."></canvas>
+        <div class="loading" id="loadingState" role="status">
+          <b>BUILDING THE FACE</b>
+          <span>6.9 MB model · 256 waves · no upload</span>
+        </div>
+        <div class="drag-callout" id="dragCallout">DRAG ME</div>
+        <div class="corner-label top-left">96×96 FIELD</div>
+        <div class="corner-label top-right">IMMUTABLE ANCHOR</div>
+        <div class="corner-label bottom-right"><span id="faceNumber">FACE 01</span> / 04</div>
+      </div>
+      <div class="meter-row">
+        <span>LONGEST PULL</span>
+        <strong id="pullMeter">00 PX</strong>
+        <span class="meter-divider"></span>
+        <span>ACTIVE WAVES</span>
+        <strong id="waveMeter">256</strong>
+      </div>
+    </section>
+
+    <section class="controls" aria-label="Ragdoll controls">
+      <div class="control-block">
+        <p class="control-label">HOW SHOULD IT MOVE?</p>
+        <div class="mode-switch" role="group" aria-label="Deformation mode">
+          <button class="mode active" data-mode="manifold" aria-pressed="true" disabled>
+            <span>WHOLE FACE</span>
+            <small>learned coupling</small>
+          </button>
+          <button class="mode" data-mode="local" aria-pressed="false" disabled>
+            <span>ONLY THE GRAB</span>
+            <small>matched control</small>
+          </button>
+        </div>
+      </div>
+
+      <div class="control-block wave-control">
+        <div class="label-line">
+          <label class="control-label" for="waveSlider">HOW MUCH FACE?</label>
+          <output id="wavePercent" for="waveSlider">100%</output>
+        </div>
+        <input id="waveSlider" type="range" min="16" max="256" value="256" step="1" disabled>
+        <div class="presets" role="group" aria-label="Wave count presets">
+          <button data-waves="256" disabled>ALL 256</button>
+          <button data-waves="64" disabled>KEEP 25%</button>
+          <button data-waves="26" disabled>ERASE 90%</button>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="action primary" id="newFace" disabled>NEW FACE + RIG</button>
+        <button class="action" id="resetFace" disabled>RESET PULL</button>
+        <button class="action share" id="shareResult" disabled>SHARE THE DAMAGE</button>
+      </div>
+
+      <div class="receipt">
+        <p class="receipt-title">THE RECEIPT</p>
+        <p>No skeleton or hand-authored rig. The pull comes from the decoder Jacobian. The later <a href="https://github.com/anttiluode/Splatworld2">SplatWorld2</a> fire fix is built in: every frame starts from immutable anchor-relative state, never from the previous displayed pixels.</p>
+        <p>In the native gate, the unpinned side moved <strong>4.4–9.7×</strong> more than the local control; random weights scored <strong>0.41×</strong>.</p>
+        <a href="https://github.com/anttiluode/TinyAvatar2#the-ragdoll-gates-measured">SEE THE TESTS →</a>
+      </div>
+    </section>
+  </main>
+
+  <noscript>This experiment needs JavaScript to run the local wave model.</noscript>
+</body>
+</html>

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Dependency-free structural checks for the static browser demo."""
+
+from __future__ import annotations
+
+import json
+import re
+import struct
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WEB = ROOT / "web"
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise SystemExit(f"web check failed: {message}")
+
+
+def main() -> None:
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    local_refs = []
+    for ref in re.findall(r'(?:href|src)="([^"]+)"', html):
+        if ref.startswith(("http://", "https://", "#")):
+            continue
+        local_refs.append(ref)
+        require((WEB / ref).is_file(), f"missing local asset {ref}")
+
+    controls = (WEB / "controls.bin").read_bytes()
+    require(controls[:4] == b"TAV1", "bad control-map magic")
+    version, anchors, packets, latent = struct.unpack_from("<IIII", controls, 4)
+    require((version, packets, latent) == (1, 256, 128), "unexpected control-map dimensions")
+    expected_size = 20 + anchors * (4 + 4 * latent + 2 * 4 * packets * latent)
+    require(len(controls) == expected_size, "truncated or extended control map")
+
+    metadata = json.loads((WEB / "controls.json").read_text(encoding="utf-8"))
+    require(metadata["format"] == "tinyavatar-web-controls-v1", "bad metadata format")
+    require(len(metadata["anchors"]) == anchors, "metadata/control anchor mismatch")
+    require(metadata["num_packets"] == packets, "metadata/control packet mismatch")
+
+    poster = (WEB / "poster.png").read_bytes()
+    require(poster[:8] == b"\x89PNG\r\n\x1a\n", "poster is not a PNG")
+    width, height = struct.unpack_from(">II", poster, 16)
+    require((width, height) == (96, 96), "poster dimensions do not match model")
+
+    model = WEB / "tinyavatar.onnx"
+    require(model.stat().st_size > 1_000_000, "ONNX model is missing or suspiciously small")
+    print(
+        f"web demo ok: {anchors} faces, {packets} packets, "
+        f"{len(local_refs)} local page assets, {model.stat().st_size / 1e6:.1f} MB model"
+    )
+
+
+if __name__ == "__main__":
+    main()
