@@ -4,6 +4,11 @@
   const MODEL_SIZE = 96;
   const PACKETS = 256;
   const PARAMS_PER_PACKET = 11;
+  // Browser manifold edits use a frozen per-anchor Jacobian, so keep them
+  // inside a deliberately local trust region around that immutable anchor.
+  // This blocks the old pointer-event integrator from walking arbitrarily
+  // far off distribution while still leaving several latent units to pull.
+  const LATENT_TRUST_RADIUS = 3.0;
 
   const ui = {
     canvas: document.querySelector("#faceCanvas"),
@@ -177,7 +182,6 @@
     state.params = copyArray(outputs.packet_params.data);
     paintField(outputs.rendered_image.data);
     drawDisplay();
-
     if (!state.ready) {
       state.ready = true;
       rankPackets();
@@ -362,9 +366,9 @@
     }
 
     const inverseWeight = 1 / Math.max(1e-9, weightSum);
-    // The desktop solver can afford many 0.08-damped iterations at ~32 fps.
-    // Browser WASM renders at a lower cadence, so this local linearization
-    // uses lighter damping and keeps the same 0.8 latent-step safety cap.
+    // Browser WASM uses one frozen per-anchor linearization rather than the
+    // native iterative Jacobian. Damping handles near-singular pins; the
+    // target solve below is additionally bounded by LATENT_TRUST_RADIUS.
     let xx = .005 ** 2;
     let xy = 0;
     let yy = .005 ** 2;
@@ -386,23 +390,38 @@
     };
   }
 
-  function latentStep(pin, dx, dy) {
+  function solvePinDelta(pin, dx, dy) {
     const solveX = pin.inv00 * dx + pin.inv01 * dy;
     const solveY = pin.inv10 * dx + pin.inv11 * dy;
     const delta = new Float32Array(128);
+    for (let latent = 0; latent < 128; latent += 1) {
+      delta[latent] = pin.rowX[latent] * solveX + pin.rowY[latent] * solveY;
+    }
+    return delta;
+  }
+
+  function setLatentOffset(candidate) {
     let norm2 = 0;
     for (let latent = 0; latent < 128; latent += 1) {
-      const value = pin.rowX[latent] * solveX + pin.rowY[latent] * solveY;
-      delta[latent] = value;
-      norm2 += value * value;
+      norm2 += candidate[latent] * candidate[latent];
     }
     const norm = Math.sqrt(norm2);
-    const scale = norm > .8 ? .8 / norm : 1;
+    const scale = norm > LATENT_TRUST_RADIUS ? LATENT_TRUST_RADIUS / norm : 1;
     const anchorZ = state.anchors[state.anchorIndex].z;
     for (let latent = 0; latent < 128; latent += 1) {
-      state.latentOffset[latent] += delta[latent] * scale;
-      state.z[latent] = anchorZ[latent] + state.latentOffset[latent];
+      const offset = candidate[latent] * scale;
+      state.latentOffset[latent] = offset;
+      state.z[latent] = anchorZ[latent] + offset;
     }
+  }
+
+  function latentTarget(pin, baseOffset, dx, dy) {
+    const delta = solvePinDelta(pin, dx, dy);
+    const candidate = new Float32Array(128);
+    for (let latent = 0; latent < 128; latent += 1) {
+      candidate[latent] = baseOffset[latent] + delta[latent];
+    }
+    setLatentOffset(candidate);
   }
 
   function localStep(weights, dx, dy) {
@@ -428,6 +447,7 @@
       pointer: point,
       weights,
       pin: buildPin(weights),
+      baseOffset: copyArray(state.latentOffset),
     };
     drawDisplay();
   }
@@ -441,8 +461,15 @@
     state.drag.last = point;
     state.drag.pointer = point;
 
-    if (state.mode === "manifold") latentStep(state.drag.pin, dx, dy);
-    else localStep(state.drag.weights, dx, dy);
+    if (state.mode === "manifold") {
+      // Target-seeking, not an integrator: the same pointer location gives
+      // the same latent target regardless of browser event rate.
+      const targetX = point[0] - state.drag.start[0];
+      const targetY = point[1] - state.drag.start[1];
+      latentTarget(state.drag.pin, state.drag.baseOffset, targetX, targetY);
+    } else {
+      localStep(state.drag.weights, dx, dy);
+    }
 
     const totalX = point[0] - state.drag.start[0];
     const totalY = point[1] - state.drag.start[1];
@@ -468,8 +495,11 @@
       const weights = grabWeights([.5, .43]);
       state.keyboardGrab = { weights, pin: buildPin(weights) };
     }
-    if (state.mode === "manifold") latentStep(state.keyboardGrab.pin, dx, dy);
-    else localStep(state.keyboardGrab.weights, dx, dy);
+    if (state.mode === "manifold") {
+      latentTarget(state.keyboardGrab.pin, copyArray(state.latentOffset), dx, dy);
+    } else {
+      localStep(state.keyboardGrab.weights, dx, dy);
+    }
     state.maxPull += MODEL_SIZE * Math.hypot(dx, dy);
     updateMeters();
     requestInference();
