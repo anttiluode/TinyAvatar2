@@ -1,5 +1,11 @@
 # TinyAvatar 2
 
+Try it at:  
+
+![pic](pic2.png)
+
+https://anttiluode.github.io/TinyAvatar2/
+
 EDIT: Added manifold flow which tries to use the tinyavatar model AND 
 stable diffusion turbo. (It loads it from huggingface if you do not have it). 
 Sort of harebrained idea. I used it on a model made of myself and then manual 
